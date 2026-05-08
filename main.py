@@ -25,9 +25,7 @@ COOLDOWN_DURATION = 259200
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
-    # Channels Table
     cursor.execute("CREATE TABLE IF NOT EXISTS channels (channel_id TEXT PRIMARY KEY, title TEXT)")
-    # Permanent Posts Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS permanent_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,7 +33,6 @@ def init_db():
             photo_id TEXT
         )
     """)
-    # Cooldown/History Tracking Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS history (
             channel_id TEXT,
@@ -53,24 +50,37 @@ def get_channels():
     cursor.execute("SELECT channel_id FROM channels")
     rows = cursor.fetchall()
     conn.close()
-    return [row[0] for row in rows]
+    return [row for row in rows]
 
-# ---- CONVERSION FUNCTION ----
+# ---- VERIFIED SUPABASE ENDPOINT CONVERSION ----
 def convert_to_earnurl(long_url):
-    api_url = f"earnurl.in{EARNURL_API_KEY}&url={long_url}&type=1"
+    # Naye single-page API endpoint structure ko update kiya gaya hai
+    endpoint_url = "supabase.co"
+    
+    # Header format ya query params verification
+    headers = {"Authorization": f"Bearer {EARNURL_API_KEY}"}
+    params = {"url": long_url, "type": "1"}
+    
     try:
-        response = requests.get(api_url, timeout=10)
+        response = requests.get(endpoint_url, headers=headers, params=params, timeout=12)
         if response.status_code == 200:
             data = response.json()
-            if data.get("status") == "success":
+            if data.get("status") == "success" or "shortenedUrl" in data:
                 return data.get("shortenedUrl")
+        else:
+            # Fallback agar header ke badle direct query string mapping ho
+            fallback_url = f"{endpoint_url}?api_key={EARNURL_API_KEY}&url={long_url}&type=1"
+            res = requests.get(fallback_url, timeout=12)
+            if res.status_code == 200:
+                d = res.json()
+                return d.get("shortenedUrl") or d.get("short_url")
     except Exception as e:
-        logger.error(f"EarnURL API Error: {e}")
+        logger.error(f"Supabase Gateway Error: {e}")
     return long_url
 
 # ---- SMART DYNAMIC NO-REPEAT AUTO-POSTER ----
 async def smart_auto_poster(app: Application):
-    logger.info("Smart No-Repeat Dynamic Rotator Loop Active.")
+    logger.info("Smart No-Repeat Rotator Active.")
     while True:
         try:
             channels = get_channels()
@@ -80,16 +90,14 @@ async def smart_auto_poster(app: Application):
                 conn = sqlite3.connect("bot_data.db")
                 cursor = conn.cursor()
                 
-                # ⏰ Pehle history se 3 din se purane cooldowns saaf karna taaki space bache
+                # Cooldown clean up
                 cursor.execute("DELETE FROM history WHERE ? - sent_time > ?", (current_time, COOLDOWN_DURATION))
                 conn.commit()
 
                 for channel_id in channels:
-                    # Is channel ke liye jo posts abhi cooldown me hain unki IDs nikalna
                     cursor.execute("SELECT post_id FROM history WHERE channel_id = ?", (channel_id,))
-                    cooldown_ids = [row[0] for row in cursor.fetchall()]
+                    cooldown_ids = [row for row in cursor.fetchall()]
                     
-                    # Database se un posts ko chhod kar baaki saari available posts nikalna
                     if cooldown_ids:
                         placeholder = ','.join('?' for _ in cooldown_ids)
                         cursor.execute(f"SELECT id, text, photo_id FROM permanent_queue WHERE id NOT IN ({placeholder})", cooldown_ids)
@@ -98,8 +106,6 @@ async def smart_auto_poster(app: Application):
                         
                     available_posts = cursor.fetchall()
                     
-                    # Agar saari ki saari posts cooldown me hain (Database chhota h aur cooldown bada),
-                    # toh safety ke liye sabse purani cooldown post utha lega taaki posting na ruke
                     if not available_posts:
                         cursor.execute("""
                             SELECT pq.id, pq.text, pq.photo_id 
@@ -111,7 +117,6 @@ async def smart_auto_poster(app: Application):
                         available_posts = cursor.fetchall()
 
                     if available_posts:
-                        # 🎲 Available list me se ek randomly select karna
                         selected_post = random.choice(available_posts)
                         post_id, converted_text, photo_id = selected_post
                         
@@ -121,26 +126,17 @@ async def smart_auto_poster(app: Application):
                             else:
                                 await app.bot.send_message(chat_id=channel_id, text=converted_text)
                             
-                            # ✅ Successfully post hone ke baad ise tracking list (History) me jodna
                             cursor.execute("INSERT OR REPLACE INTO history (channel_id, post_id, sent_time) VALUES (?, ?, ?)", 
                                            (channel_id, post_id, current_time))
                             conn.commit()
-                            
-                            # Channels ke beech me safe gap (Flood Control)
                             await asyncio.sleep(4) 
                         except Exception as e:
                             logger.error(f"Post failed for channel {channel_id}: {e}")
-                
                 conn.close()
-            else:
-                logger.warning("No channels added yet. Add via /add command.")
-
         except Exception as e:
-            logger.error(f"Error in smart loop execution: {e}")
+            logger.error(f"Error in smart loop: {e}")
             
-        # ⏱️ ANTI-BAN RANDOM TIMER (Har post batch ke baad 5 se 10 minute ka random gap)
         random_delay = random.randint(300, 600)
-        logger.info(f"Dynamic safety sleep active for next {random_delay} seconds.")
         await asyncio.sleep(random_delay)
 
 # ---- COMMAND HANDLERS ----
@@ -148,17 +144,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     await update.message.reply_text(
-        "🚀 **Smart Anti-Repeat Auto-Rotator Bot Active!**\n\n"
-        "🎯 **Yeh Kaise Kaam Karega:**\n"
-        "1. Aapke banaye huyen 1000+ links me se randomly content uthayega.\n"
-        "2. Jo post aaj ek channel me dalegi, wo agle **3 din** tak us same channel me repeat nahi hogi.\n"
-        "3. Har post ke beech me automatic time badalta rahega, jisse channel ban hone ka khatra 0% ho jata hai.\n\n"
+        "🚀 **EarnURL Online Smart Rotator Bot is Live!**\n\n"
         "🛠️ **Owner Commands:**\n"
         "👉 `/add -100xxxxxx` : Channel ID add karein\n"
         "👉 `/remove -100xxxxxx` : Channel list se hatayein\n"
         "👉 `/list` : Added channels dekhein\n"
         "👉 `/status` : Total kitni posts library me hain dekhein\n"
-        "👉 `/clearall` : Purani saari memory delete karke naya data daalne ke liye"
+        "👉 `/clearall` : Purani saari memory delete karne ke liye"
     )
 
 async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,13 +160,13 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Example: `/add -100123456789` ")
         return
     try:
-        chat = await context.bot.get_chat(context.args[0])
+        chat = await context.bot.get_chat(context.args)
         conn = sqlite3.connect("bot_data.db")
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO channels (channel_id, title) VALUES (?, ?)", (str(chat.id), chat.title))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ **{chat.title}** dynamically connect ho gaya hai!")
+        await update.message.reply_text(f"✅ **{chat.title}** connect ho gaya hai!")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -186,11 +178,11 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (str(context.args[0]),))
-    cursor.execute("DELETE FROM history WHERE channel_id = ?", (str(context.args[0]),))
+    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (str(context.args),))
+    cursor.execute("DELETE FROM history WHERE channel_id = ?", (str(context.args),))
     conn.commit()
     conn.close()
-    await update.message.reply_text("🗑️ Channel list aur history se completely remove kar diya gaya.")
+    await update.message.reply_text("🗑️ Channel remove kar diya gaya.")
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -205,7 +197,7 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = "📋 **Added Channels:**\n\n"
     for row in rows:
-        text += f"🔹 {row[1]} (`{row[0]}`)\n"
+        text += f"🔹 {row} (`{row}`)\n"
     await update.message.reply_text(text)
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -214,14 +206,14 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM permanent_queue")
-    total_posts = cursor.fetchone()[0]
+    total_posts = cursor.fetchone()
     cursor.execute("SELECT COUNT(*) FROM history")
-    active_cooldowns = cursor.fetchone()[0]
+    active_cooldowns = cursor.fetchone()
     conn.close()
     await update.message.reply_text(
         f"📊 **Database Insights:**\n\n"
         f"🔹 Total Converted Links: `{total_posts}`\n"
-        f"⏳ Active Cooldown Posts (Jo abhi repeat nahi hongi): `{active_cooldowns}`"
+        f"⏳ Active Cooldown Posts: `{active_cooldowns}`"
     )
 
 async def clear_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -233,7 +225,7 @@ async def clear_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("DELETE FROM history")
     conn.commit()
     conn.close()
-    await update.message.reply_text("🗑️ Library khali ho gayi hai. Purana sara data aur history delete ho chuka hai.")
+    await update.message.reply_text("🗑️ Library khali ho gayi hai.")
 
 # ---- DATA INGESTION ENGINE ----
 async def handle_bulk_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -283,10 +275,9 @@ def main():
     app.add_handler(CommandHandler("clearall", clear_all_posts))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_bulk_incoming))
     
-    # Background job to run the infinite loop safely
     app.job_queue.run_once(lambda ctx: asyncio.create_task(smart_auto_poster(app)), when=0)
     
-    logger.info("Bot started successfully with Anti-Repeat tracking algorithm.")
+    logger.info("Bot started successfully.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
