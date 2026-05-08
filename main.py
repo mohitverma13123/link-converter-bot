@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # ---- CONFIGURATION ----
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 EARNURL_API_KEY = os.getenv("EARNURL_API_KEY")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = 2091839003
 
 COOLDOWN_DURATION = 259200 # 3 Days
 
