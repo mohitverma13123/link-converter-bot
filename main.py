@@ -53,6 +53,40 @@ def get_channels():
 
 # ---- CONVERSION FUNCTION ----
 def convert_to_earnurl(long_url):
+    # Aapke naye official Supabase Endpoint aur API key ki testing mapping
+    endpoint_url = "supabase.co"
+    
+    # Isme direct query string params aur headers dono ek sath bhej rahe hain taki conversion fail na ho
+    params = {
+        "api_key": EARNURL_API_KEY,
+        "url": long_url,
+        "type": "1"  # Single page standard domain route
+    }
+    headers = {
+        "Authorization": f"Bearer {EARNURL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        # Method 1: Direct GET request with parameters
+        response = requests.get(endpoint_url, params=params, headers=headers, timeout=12)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success" or "shortenedUrl" in data:
+                return data.get("shortenedUrl") or data.get("short_url")
+                
+        # Method 2 (Fallback): Agar unka server POST method accept karta ho
+        json_data = {"url": long_url, "api_key": EARNURL_API_KEY, "type": 1}
+        res = requests.post(endpoint_url, json=json_data, headers=headers, timeout=12)
+        if res.status_code == 200:
+            d = res.json()
+            return d.get("shortenedUrl") or d.get("short_url") or d.get("url")
+            
+    except Exception as e:
+        logger.error(f"Supabase Direct Sync Error: {e}")
+        
+    return long_url
+
     # Endpoint configured matching your direct api structure
     api_url = f"supabase.co{EARNURL_API_KEY}&url={long_url}&type=1"
     try:
