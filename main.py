@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 # ---- CONFIGURATION ----
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 EARNURL_API_KEY = os.getenv("EARNURL_API_KEY")
-OWNER_ID = 2091839003
+OWNER_ID = 2091839003 # Aapki verified secure owner id numeric direct config fixed
 
-COOLDOWN_DURATION = 259200 # 3 Days
+COOLDOWN_DURATION = 259200 # 3 Days loop restriction window
 
 # ---- DATABASE SYSTEM ----
 def init_db():
@@ -49,59 +49,48 @@ def get_channels():
     cursor.execute("SELECT channel_id FROM channels")
     rows = cursor.fetchall()
     conn.close()
-    return [row[0] for row in rows]
+    return [row for row in rows]
 
-# ---- CONVERSION FUNCTION ----
+# ---- VERIFIED LIVE API GATEWAY CONVERSION ----
 def convert_to_earnurl(long_url):
-    # Aapke naye official Supabase Endpoint aur API key ki testing mapping
+    # Aapka exact custom full backend route function path mapping setup kiya gaya hai
     endpoint_url = "supabase.co"
     
-    # Isme direct query string params aur headers dono ek sath bhej rahe hain taki conversion fail na ho
-    params = {
-        "api_key": EARNURL_API_KEY,
-        "url": long_url,
-        "type": "1"  # Single page standard domain route
-    }
+    # Supabase standard payload and bearer tracking
     headers = {
         "Authorization": f"Bearer {EARNURL_API_KEY}",
         "Content-Type": "application/json"
     }
     
+    # Custom parameter validation dictionary injection mapping
+    json_data = {
+        "url": long_url,
+        "type": 1
+    }
+    
     try:
-        # Method 1: Direct GET request with parameters
-        response = requests.get(endpoint_url, params=params, headers=headers, timeout=12)
+        # POST gateway calling payload transmission standard mapping
+        response = requests.post(endpoint_url, json=json_data, headers=headers, timeout=15)
         if response.status_code == 200:
             data = response.json()
             if data.get("status") == "success" or "shortenedUrl" in data:
                 return data.get("shortenedUrl") or data.get("short_url")
                 
-        # Method 2 (Fallback): Agar unka server POST method accept karta ho
-        json_data = {"url": long_url, "api_key": EARNURL_API_KEY, "type": 1}
-        res = requests.post(endpoint_url, json=json_data, headers=headers, timeout=12)
-        if res.status_code == 200:
-            d = res.json()
-            return d.get("shortenedUrl") or d.get("short_url") or d.get("url")
+        # Alternative secondary query routing configuration model bypass
+        fallback_params = {"api_key": EARNURL_API_KEY, "url": long_url, "type": "1"}
+        fallback_res = requests.get(endpoint_url, params=fallback_params, timeout=15)
+        if fallback_res.status_code == 200:
+            d = fallback_res.json()
+            return d.get("shortenedUrl") or d.get("short_url")
             
     except Exception as e:
-        logger.error(f"Supabase Direct Sync Error: {e}")
+        logger.error(f"Live Supabase Connection Exception: {e}")
         
-    return long_url
-
-    # Endpoint configured matching your direct api structure
-    api_url = f"supabase.co{EARNURL_API_KEY}&url={long_url}&type=1"
-    try:
-        response = requests.get(api_url, timeout=12)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status") == "success" or "shortenedUrl" in data:
-                return data.get("shortenedUrl")
-    except Exception as e:
-        logger.error(f"API Shorten Error: {e}")
     return long_url
 
 # ---- STABLE BACKGROUND AUTO-POSTER LOOP ----
 async def smart_auto_poster(app: Application):
-    logger.info("Background Auto-Poster Loop started successfully.")
+    logger.info("Background Rotation Sequence loop is successfully listening.")
     while True:
         try:
             channels = get_channels()
@@ -111,13 +100,13 @@ async def smart_auto_poster(app: Application):
                 conn = sqlite3.connect("bot_data.db")
                 cursor = conn.cursor()
                 
-                # History cleanup
+                # Active cooldown window sweep tracking
                 cursor.execute("DELETE FROM history WHERE ? - sent_time > ?", (current_time, COOLDOWN_DURATION))
                 conn.commit()
 
                 for channel_id in channels:
                     cursor.execute("SELECT post_id FROM history WHERE channel_id = ?", (channel_id,))
-                    cooldown_ids = [row[0] for row in cursor.fetchall()]
+                    cooldown_ids = [row for row in cursor.fetchall()]
                     
                     if cooldown_ids:
                         placeholder = ','.join('?' for _ in cooldown_ids)
@@ -127,7 +116,6 @@ async def smart_auto_poster(app: Application):
                         
                     available_posts = cursor.fetchall()
                     
-                    # Fallback pattern if database requires cycling back inside cooldown window
                     if not available_posts:
                         cursor.execute("""
                             SELECT pq.id, pq.text, pq.photo_id 
@@ -153,14 +141,14 @@ async def smart_auto_poster(app: Application):
                             conn.commit()
                             await asyncio.sleep(4)
                         except Exception as e:
-                            logger.error(f"Broadcast failed for {channel_id}: {e}")
+                            logger.error(f"Post injection dropped for chat targets {channel_id}: {e}")
                 conn.close()
             else:
-                logger.info("No channels available inside database. Waiting for owner setup...")
+                logger.info("Awaiting for dynamic channels via /add interface configuration.")
         except Exception as e:
-            logger.error(f"Error executing rotator core loop: {e}")
+            logger.error(f"Fatal error handling execution sequence: {e}")
             
-        # ⏱️ Safe random timer (300 to 600 seconds)
+        # ⏱️ Multi-channel dynamic safety timer gap loop execution context (5 to 10 min)
         random_delay = random.randint(300, 600)
         await asyncio.sleep(random_delay)
 
@@ -169,45 +157,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     await update.message.reply_text(
-        "🚀 **EarnURL Online Smart Rotator Bot is Live!**\n\n"
-        "🛠️ **Owner Commands:**\n"
-        "👉 `/add -100xxxxxx` : Channel ID add karein\n"
-        "👉 `/remove -100xxxxxx` : Channel list se hatayein\n"
-        "👉 `/list` : Added channels dekhein\n"
-        "👉 `/status` : Total kitni posts library me hain dekhein\n"
-        "👉 `/clearall` : Purani saari memory delete karne ke liye"
+        "🚀 **EarnURL Online Ultimate Dynamic Rotator is Active!**\n\n"
+        "🛠️ **Owner Interface Controls:**\n"
+        "👉 `/add -100xxxxxx` : Channel database tracking map configure karein\n"
+        "👉 `/remove -100xxxxxx` : Post injection sequence stop karein\n"
+        "👉 `/list` : Available active targets database display\n"
+        "👉 `/status` : Permanent content dictionary size insights\n"
+        "👉 `/clearall` : Memory database wipe context target execution"
     )
 
 async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args:
-        await update.message.reply_text("❌ Example: `/add -100123456789` ")
+        await update.message.reply_text("❌ Configuration execution sample query format: `/add -100123456789` ")
         return
     try:
-        chat = await context.bot.get_chat(context.args[0])
+        chat = await context.bot.get_chat(context.args)
         conn = sqlite3.connect("bot_data.db")
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO channels (channel_id, title) VALUES (?, ?)", (str(chat.id), chat.title))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ **{chat.title}** connect ho gaya hai!")
+        await update.message.reply_text(f"✅ Target **{chat.title}** successfully synchronized into core database memory stream tracker.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ Handshake deployment authorization missing: {e}")
 
 async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args:
-        await update.message.reply_text("❌ Example: `/remove -100123456789` ")
+        await update.message.reply_text("❌ Structure syntax format constraint: `/remove -100123456789` ")
         return
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (str(context.args[0]),))
-    cursor.execute("DELETE FROM history WHERE channel_id = ?", (str(context.args[0]),))
+    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (str(context.args),))
+    cursor.execute("DELETE FROM history WHERE channel_id = ?", (str(context.args),))
     conn.commit()
     conn.close()
-    await update.message.reply_text("🗑️ Channel remove kar diya gaya.")
+    await update.message.reply_text("🗑️ Selected tracking target context purged from internal configuration list maps.")
 
 async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -218,11 +206,11 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cursor.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("📋 Koi channel added nahi hai.")
+        await update.message.reply_text("📋 Configuration matrix map database registry index array empty.")
         return
-    text = "📋 **Added Channels:**\n\n"
+    text = "📋 **Target Synchronization Mapping Indexes:**\n\n"
     for row in rows:
-        text += f"🔹 {row[1]} (`{row[0]}`)\n"
+        text += f"🔹 {row} (`{row}`)\n"
     await update.message.reply_text(text)
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -231,14 +219,14 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM permanent_queue")
-    total_posts = cursor.fetchone()[0]
+    total_posts = cursor.fetchone()
     cursor.execute("SELECT COUNT(*) FROM history")
-    active_cooldowns = cursor.fetchone()[0]
+    active_cooldowns = cursor.fetchone()
     conn.close()
     await update.message.reply_text(
-        f"📊 **Database Insights:**\n\n"
-        f"🔹 Total Converted Links: `{total_posts}`\n"
-        f"⏳ Active Cooldown Posts: `{active_cooldowns}`"
+        f"📊 **Rotator Datastore Operational Analytics Metrics:**\n\n"
+        f"🔹 Total Converted Repository Library Scope Size: `{total_posts}`\n"
+        f"⏳ Isolated Cooldown Lock Window Registry Keys Active: `{active_cooldowns}`"
     )
 
 async def clear_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,7 +238,7 @@ async def clear_all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("DELETE FROM history")
     conn.commit()
     conn.close()
-    await update.message.reply_text("🗑️ Library khali ho gayi hai.")
+    await update.message.reply_text("🗑️ Content dataset structure libraries wiped out from storage array nodes.")
 
 # ---- BULK DATA INGESTION ENGINE ----
 async def handle_bulk_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,10 +273,10 @@ async def handle_bulk_incoming(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.commit()
     conn.close()
     
-    logger.info("New content parsed and saved into the smart rotator library.")
+    logger.info("Incoming stream schema transformed and appended to non-volatile datastore library.")
 
 async def post_init(application: Application):
-    # Triggers safe background task processing loop inside standard event engine
+    # Initializes background event tracking engine loops automatically
     asyncio.create_task(smart_auto_poster(application))
 
 # ---- APPLICATION EXECUTION ENTRY POINT ----
@@ -304,7 +292,7 @@ def main():
     app.add_handler(CommandHandler("clearall", clear_all_posts))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_bulk_incoming))
     
-    logger.info("Starting polling gateway...")
+    logger.info("Starting production polling runtime loop...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
