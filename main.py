@@ -38,15 +38,22 @@ logger = logging.getLogger(__name__)
 # =====================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MONGO_URI = os.getenv("MONGO_URI", "")
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise Exception("BOT_TOKEN missing")
+    raise Exception("BOT_TOKEN missing in environment variables")
 
 if not MONGO_URI:
-    raise Exception("MONGO_URI missing")
+    raise Exception("MONGO_URI missing in environment variables")
+
+# Explicit structural validation check to prevent PyMongo runtime crashes
+if not (MONGO_URI.startswith("mongodb://") or MONGO_URI.startswith("mongodb+srv://")):
+    raise Exception(
+        "CRITICAL error: MONGO_URI value must start with 'mongodb://' or 'mongodb+srv://'. "
+        "Please update your Environment configuration on Render."
+    )
 
 # =====================================
 # DB
@@ -98,7 +105,6 @@ async def convert_links(text):
 
     for url in urls:
         try:
-            # Agar link pehle se converted hai toh skip karein
             if "earnurl.online" in url:
                 continue
 
@@ -107,7 +113,6 @@ async def convert_links(text):
                 999999
             )
 
-            # FIX: Added missing forward slash '/' in domain path
             short_link = f"earnurl.online{random_id}"
 
             text = text.replace(url, short_link)
@@ -201,7 +206,6 @@ async def message_handler(
             ""
         )
 
-        # LINK CONVERT
         converted_text = await convert_links(text_content)
 
         photo_id = None
@@ -209,7 +213,6 @@ async def message_handler(
         if msg.photo:
             photo_id = msg.photo[-1].file_id
 
-        # SAVE DB
         post_data = {
             "text": converted_text if msg.text else None,
             "caption": converted_text if msg.caption else None,
@@ -219,7 +222,6 @@ async def message_handler(
 
         await posts_col.insert_one(post_data)
 
-        # INSTANT REPLY
         if photo_id:
             await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
@@ -337,7 +339,6 @@ async def init_web_app():
 async def main():
     await create_indexes()
 
-    # Initialize Telegram Application with modern async loops
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -345,14 +346,12 @@ async def main():
         .build()
     )
 
-    # Register handlers
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("addchannel", add_channel_cmd))
     application.add_handler(
         MessageHandler(filters.TEXT | filters.PHOTO, message_handler)
     )
 
-    # Start background scheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         auto_post_job,
