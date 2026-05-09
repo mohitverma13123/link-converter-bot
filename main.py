@@ -20,9 +20,7 @@ from telegram.error import (
 )
 
 from motor.motor_asyncio import AsyncIOMotorClient
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from aiohttp import web
 
 # =========================
@@ -246,7 +244,7 @@ async def message_handler(
         )
 
         waiting = await msg.reply_text(
-            "⏳ Saving..."
+            "⏳ Processing..."
         )
 
         converted_text = await convert_links(
@@ -309,9 +307,31 @@ async def message_handler(
             post_data
         )
 
-        await waiting.edit_text(
-            "✅ Saved"
-        )
+        # SEND FINAL CONVERTED MESSAGE
+
+        if photo_id:
+
+            await context.bot.send_photo(
+
+                chat_id=update.effective_chat.id,
+
+                photo=photo_id,
+
+                caption=converted_text
+
+            )
+
+        else:
+
+            await context.bot.send_message(
+
+                chat_id=update.effective_chat.id,
+
+                text=converted_text
+
+            )
+
+        await waiting.delete()
 
     except Exception as e:
 
