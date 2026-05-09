@@ -559,7 +559,8 @@ async def main():
 
 if __name__ == "__main__":
 
-    asyncio.run(main())import os
+    if __name__ == "__main__":
+    asyncio.run(main())
 import re
 import logging
 import asyncio
