@@ -49,7 +49,13 @@ if not MONGO_URI:
 # DB
 # =====================================
 
-client = AsyncIOMotorClient(MONGO_URI)
+client = from motor.motor_asyncio import AsyncIOMotorClient
+
+client = AsyncIOMotorClient(
+    MONGO_URI,
+    tls=True,
+    serverSelectionTimeoutMS=30000
+)
 
 db = client["earnurl_bot"]
 
