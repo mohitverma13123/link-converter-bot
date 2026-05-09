@@ -4,7 +4,7 @@ python-telegram-bot==20.7
 motor==3.3.2
 apscheduler==3.10.4
 aiohttp==3.9.5
-httpx==0.27.0
+httpx==0.25.2
 pymongo==4.6.1
 
 # runtime.txt
@@ -19,7 +19,6 @@ import logging
 import asyncio
 import random
 from datetime import datetime, timedelta
-from urllib.parse import quote
 
 from telegram import Update
 from telegram.ext import (
@@ -35,9 +34,7 @@ TelegramError,
 RetryAfter
 )
 
-from motor.motor_asyncio import (
-AsyncIOMotorClient
-)
+from motor.motor_asyncio import AsyncIOMotorClient
 
 from apscheduler.schedulers.asyncio import (
 AsyncIOScheduler
@@ -45,13 +42,11 @@ AsyncIOScheduler
 
 from aiohttp import web
 
-import httpx
-
-# ===================================
+# =========================
 
 # LOGGING
 
-# ===================================
+# =========================
 
 logging.basicConfig(
 format="%(asctime)s - %(levelname)s - %(message)s",
@@ -60,15 +55,14 @@ level=logging.INFO
 
 logger = logging.getLogger(**name**)
 
-# ===================================
+# =========================
 
 # ENV VARIABLES
 
-# ===================================
+# =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "")
-EARNURL_API = os.getenv("EARNURL_API", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -78,11 +72,11 @@ raise Exception("BOT_TOKEN missing")
 if not MONGO_URI:
 raise Exception("MONGO_URI missing")
 
-# ===================================
+# =========================
 
 # DATABASE
 
-# ===================================
+# =========================
 
 client = AsyncIOMotorClient(
 MONGO_URI,
@@ -95,21 +89,21 @@ posts_col = db["posts"]
 channels_col = db["channels"]
 history_col = db["history"]
 
-# ===================================
+# =========================
 
 # URL REGEX
 
-# ===================================
+# =========================
 
 URL_PATTERN = re.compile(
 r'https?://[^\s]+'
 )
 
-# ===================================
+# =========================
 
-# INDEXES
+# CREATE INDEXES
 
-# ===================================
+# =========================
 
 async def create_indexes():
 
@@ -133,11 +127,11 @@ except Exception as e:
     logger.error(e)
 ```
 
-# ===================================
+# =========================
 
-# LINK CONVERTER
+# DEMO LINK CONVERTER
 
-# ===================================
+# =========================
 
 async def convert_links(text):
 
@@ -150,40 +144,35 @@ urls = URL_PATTERN.findall(text)
 if not urls:
     return text
 
-async with httpx.AsyncClient() as http_client:
+for url in urls:
 
-    for url in urls:
+    try:
 
-        try:
+        if "earnurl.online" in url:
+            continue
 
-            if "earnurl.online" in url:
-                continue
+        short_link = (
+            "https://earnurl.online/"
+            + str(random.randint(10000,99999))
+        )
 
-            # DEMO SHORT LINK
-            # Replace later with real API
+        text = text.replace(
+            url,
+            short_link
+        )
 
-            short_link = (
-                "https://earnurl.online/"
-                + str(random.randint(10000,99999))
-            )
+    except Exception as e:
 
-            text = text.replace(
-                url,
-                short_link
-            )
-
-        except Exception as e:
-
-            logger.error(e)
+        logger.error(e)
 
 return text
 ```
 
-# ===================================
+# =========================
 
 # START COMMAND
 
-# ===================================
+# =========================
 
 async def start_cmd(
 update: Update,
@@ -203,11 +192,11 @@ await update.message.reply_text(
 )
 ```
 
-# ===================================
+# =========================
 
 # ADD CHANNEL
 
-# ===================================
+# =========================
 
 async def add_channel_cmd(
 update: Update,
@@ -269,11 +258,11 @@ except Exception as e:
     )
 ```
 
-# ===================================
+# =========================
 
 # SAVE POSTS
 
-# ===================================
+# =========================
 
 async def message_handler(
 update: Update,
@@ -323,7 +312,7 @@ try:
     if duplicate:
 
         await waiting.edit_text(
-            "⚠ Duplicate"
+            "⚠ Duplicate Post"
         )
 
         return
@@ -373,11 +362,11 @@ except Exception as e:
     logger.error(e)
 ```
 
-# ===================================
+# =========================
 
 # AUTO POSTER
 
-# ===================================
+# =========================
 
 async def auto_post_job(app):
 
@@ -533,11 +522,11 @@ except Exception as e:
     logger.error(e)
 ```
 
-# ===================================
+# =========================
 
 # KEEP ALIVE
 
-# ===================================
+# =========================
 
 async def home(request):
 
@@ -547,11 +536,11 @@ return web.Response(
 )
 ```
 
-# ===================================
+# =========================
 
 # MAIN
 
-# ===================================
+# =========================
 
 async def main():
 
@@ -652,11 +641,11 @@ while True:
     await asyncio.sleep(3600)
 ```
 
-# ===================================
+# =========================
 
 # START
 
-# ===================================
+# =========================
 
 if **name** == "**main**":
 
