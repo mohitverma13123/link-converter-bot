@@ -26,14 +26,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment Variables
+# Environment Variables (Sirf ye teen Render par daalna)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 EARNURL_API = os.getenv("EARNURL_API")
 PORT = int(os.getenv("PORT", "8080"))
 
+# Fixed Owner Admin ID for security
+ADMIN_ID = 2091839003
+
 if not BOT_TOKEN or not MONGO_URI or not EARNURL_API:
-    raise ValueError("CRITICAL: BOT_TOKEN, MONGO_URI aur EARNURL_API variables set karein!")
+    raise ValueError("CRITICAL: BOT_TOKEN, MONGO_URI aur EARNURL_API variables Render par set karein!")
 
 # MongoDB Initialization
 client = AsyncIOMotorClient(MONGO_URI)
@@ -55,9 +58,8 @@ async def convert_links(text: str) -> str:
 
     async with httpx.AsyncClient() as http_client:
         for url in urls:
-            # EarnURL shortener standard API format
             if "earnurl.online" in url:
-                continue # Pehle se short kiye gaye links ko skip karein
+                continue # Pehle se shortened links ko skip karein
                 
             try:
                 api_url = f"earnurl.online{EARNURL_API}&url={url}"
@@ -65,7 +67,6 @@ async def convert_links(text: str) -> str:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    # EarnURL JSON response handler
                     if data.get("status") == "success" and data.get("shortenedUrl"):
                         short_url = data["shortenedUrl"]
                         text = text.replace(url, short_url)
@@ -76,17 +77,28 @@ async def convert_links(text: str) -> str:
     return text
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Security check for start command
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Aap is bot ke admin nahi hain!")
+        return
+        
     await update.message.reply_text(
-        "👋 Hello! Main ek advanced Auto-Posting Bot hoon.\n\n"
+        "👋 Hello Malik! Main aapka advanced Auto-Posting Bot hoon.\n\n"
         "📢 *Commands:*\n"
         "/addchannel <Channel_ID> - Naya channel add karein\n\n"
-        "👉 Koi bhi post mujhe forward ya send karein, main use save kar loonga."
+        "👉 Koi bhi post mujhe forward ya send karein, main use convert karke save kar loonga."
     )
 
 async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Security check: Sirf aap hi channel add kar sakte hain
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Aap is bot ke admin nahi hain!")
+        return
+
     if not context.args:
         await update.message.reply_text("❌ Format: `/addchannel -100xxxxxxxxx`")
         return
+        
     channel_id = context.args[0].strip()
     try:
         channel_id_int = int(channel_id)
@@ -94,18 +106,21 @@ async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if exists:
             await update.message.reply_text("ℹ️ Yeh channel pehle se added hai.")
             return
+            
         await channels_col.insert_one({"channel_id": channel_id_int, "added_at": datetime.utcnow()})
         await update.message.reply_text(f"✅ Channel `{channel_id_int}` successfully add ho gaya!")
     except ValueError:
         await update.message.reply_text("❌ Channel ID sirf numbers me honi chahiye.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Security check: Koi dusra aapke bot me posts save na kar sake
+    if update.effective_user.id != ADMIN_ID:
+        return
+
     msg = update.message
     text_content = msg.text or msg.caption or ""
     
-    # Send waiting message for heavy process
     waiting_msg = await msg.reply_text("⏳ Links convert ho rahe hain aur post save ho rahi hai...")
-    
     updated_text = await convert_links(text_content)
     
     post_data = {
@@ -121,6 +136,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Auto-posting cycle started...")
     channels = await channels_col.find().to_list(length=100)
     if not channels:
+        logger.warning("Posting skipped: Koi channel added nahi hai.")
         return
     
     total_posts_to_send = random.randint(2, 5)
@@ -159,7 +175,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
                 break
             except FloodWait as e:
                 await asyncio.sleep(e.retry_after)
-            except TelegramError:
+            except TelegramError as e:
+                logger.error(f"Telegram error on channel {chan_id}: {e}")
                 continue
 
 async def handle_ping(request):
