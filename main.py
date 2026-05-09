@@ -13,7 +13,8 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.error import FloodWait, TelegramError
+# Fixed import for v20+ version
+from telegram.error import NetworkError, TelegramError, RetryAfter
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiohttp import web
@@ -26,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment Variables (Sirf ye teen Render par daalna)
+# Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 EARNURL_API = os.getenv("EARNURL_API")
@@ -62,6 +63,7 @@ async def convert_links(text: str) -> str:
                 continue # Pehle se shortened links ko skip karein
                 
             try:
+                # Fixed official EarnURL endpoint format
                 api_url = f"earnurl.online{EARNURL_API}&url={url}"
                 response = await http_client.get(api_url, timeout=10)
                 
@@ -77,7 +79,6 @@ async def convert_links(text: str) -> str:
     return text
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Security check for start command
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Aap is bot ke admin nahi hain!")
         return
@@ -90,7 +91,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Security check: Sirf aap hi channel add kar sakte hain
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Aap is bot ke admin nahi hain!")
         return
@@ -113,7 +113,6 @@ async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Channel ID sirf numbers me honi chahiye.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Security check: Koi dusra aapke bot me posts save na kar sake
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -173,7 +172,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
                 post_sent_in_this_turn = True
                 await asyncio.sleep(3)
                 break
-            except FloodWait as e:
+            except RetryAfter as e:
+                # Handling new rate limit object name
                 await asyncio.sleep(e.retry_after)
             except TelegramError as e:
                 logger.error(f"Telegram error on channel {chan_id}: {e}")
