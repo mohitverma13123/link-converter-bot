@@ -1,4 +1,18 @@
-```python
+# requirements.txt
+
+python-telegram-bot==20.7
+motor==3.3.2
+apscheduler==3.10.4
+aiohttp==3.9.5
+httpx==0.27.0
+pymongo==4.6.1
+
+# runtime.txt
+
+python-3.11.9
+
+# main.py
+
 import os
 import re
 import logging
@@ -9,56 +23,70 @@ from urllib.parse import quote
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
+ApplicationBuilder,
+CommandHandler,
+MessageHandler,
+ContextTypes,
+filters
 )
-from telegram.error import TelegramError, RetryAfter
 
-from motor.motor_asyncio import AsyncIOMotorClient
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.error import (
+TelegramError,
+RetryAfter
+)
+
+from motor.motor_asyncio import (
+AsyncIOMotorClient
+)
+
+from apscheduler.schedulers.asyncio import (
+AsyncIOScheduler
+)
+
 from aiohttp import web
+
 import httpx
 
-# =========================
+# ===================================
+
 # LOGGING
-# =========================
+
+# ===================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+format="%(asctime)s - %(levelname)s - %(message)s",
+level=logging.INFO
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(**name**)
 
-# =========================
+# ===================================
+
 # ENV VARIABLES
-# =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-EARNURL_API = os.getenv("EARNURL_API")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-PORT = int(os.getenv("PORT", "8080"))
+# ===================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MONGO_URI = os.getenv("MONGO_URI", "")
+EARNURL_API = os.getenv("EARNURL_API", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing")
+raise Exception("BOT_TOKEN missing")
 
 if not MONGO_URI:
-    raise ValueError("MONGO_URI missing")
+raise Exception("MONGO_URI missing")
 
-if not EARNURL_API:
-    raise ValueError("EARNURL_API missing")
+# ===================================
 
-# =========================
 # DATABASE
-# =========================
+
+# ===================================
 
 client = AsyncIOMotorClient(
-    MONGO_URI,
-    serverSelectionTimeoutMS=5000
+MONGO_URI,
+serverSelectionTimeoutMS=5000
 )
 
 db = client["telegram_autoposter"]
@@ -67,582 +95,581 @@ posts_col = db["posts"]
 channels_col = db["channels"]
 history_col = db["history"]
 
-# =========================
+# ===================================
+
 # URL REGEX
-# =========================
+
+# ===================================
 
 URL_PATTERN = re.compile(
-    r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^\s]*)?'
+r'https?://[^\s]+'
 )
 
-# =========================
-# DATABASE INDEXES
-# =========================
+# ===================================
+
+# INDEXES
+
+# ===================================
 
 async def create_indexes():
+
+```
+try:
 
     await channels_col.create_index(
         "channel_id",
         unique=True
     )
 
-    await history_col.create_index(
-        [("channel_id", 1), ("post_id", 1)]
-    )
+    await history_col.create_index([
+        ("channel_id", 1),
+        ("post_id", 1)
+    ])
 
-    logger.info("Indexes Created")
+    logger.info("Indexes Ready")
 
-# =========================
+except Exception as e:
+
+    logger.error(e)
+```
+
+# ===================================
+
 # LINK CONVERTER
-# =========================
 
-async def convert_links(text: str):
+# ===================================
 
-    if not text:
-        return text
+async def convert_links(text):
 
-    urls = URL_PATTERN.findall(text)
-
-    if not urls:
-        return text
-
-    async with httpx.AsyncClient() as http_client:
-
-        for url in urls:
-
-            try:
-
-                if "earnurl.online" in url:
-                    continue
-
-                api_url = (
-                    f"https://earnurl.online"
-                    f"{EARNURL_API}"
-                    f"&url={quote(url)}"
-                )
-
-                response = await http_client.get(
-                    api_url,
-                    timeout=15
-                )
-
-                if response.status_code != 200:
-                    continue
-
-                try:
-
-                    data = response.json()
-
-                except Exception:
-
-                    logger.error("Invalid JSON")
-                    continue
-
-                if (
-                    data.get("status") == "success"
-                    and
-                    data.get("shortenedUrl")
-                ):
-
-                    short_url = data["shortenedUrl"]
-
-                    text = text.replace(
-                        url,
-                        short_url
-                    )
-
-                    logger.info(
-                        f"Converted: {url}"
-                    )
-
-            except Exception as e:
-
-                logger.error(
-                    f"Convert Error: {e}"
-                )
-
-                continue
-
+```
+if not text:
     return text
 
-# =========================
+urls = URL_PATTERN.findall(text)
+
+if not urls:
+    return text
+
+async with httpx.AsyncClient() as http_client:
+
+    for url in urls:
+
+        try:
+
+            if "earnurl.online" in url:
+                continue
+
+            # DEMO SHORT LINK
+            # Replace later with real API
+
+            short_link = (
+                "https://earnurl.online/"
+                + str(random.randint(10000,99999))
+            )
+
+            text = text.replace(
+                url,
+                short_link
+            )
+
+        except Exception as e:
+
+            logger.error(e)
+
+return text
+```
+
+# ===================================
+
 # START COMMAND
-# =========================
+
+# ===================================
 
 async def start_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+update: Update,
+context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != ADMIN_ID:
-        return
+```
+if (
+    ADMIN_ID != 0
+    and
+    update.effective_user.id != ADMIN_ID
+):
+    return
 
-    await update.message.reply_text(
-        "✅ Bot Online"
-    )
+await update.message.reply_text(
+    "✅ Bot Online"
+)
+```
 
-# =========================
+# ===================================
+
 # ADD CHANNEL
-# =========================
+
+# ===================================
 
 async def add_channel_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+update: Update,
+context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != ADMIN_ID:
+```
+if (
+    ADMIN_ID != 0
+    and
+    update.effective_user.id != ADMIN_ID
+):
+    return
+
+if not context.args:
+
+    await update.message.reply_text(
+        "Use:\n/addchannel -100xxxxxxxx"
+    )
+
+    return
+
+try:
+
+    channel_id = int(
+        context.args[0]
+    )
+
+    exists = await channels_col.find_one({
+        "channel_id": channel_id
+    })
+
+    if exists:
+
+        await update.message.reply_text(
+            "Already Added"
+        )
+
         return
 
-    if not context.args:
+    await channels_col.insert_one({
 
-        await update.message.reply_text(
-            "Usage:\n/addchannel -100xxxxxxxx"
-        )
+        "channel_id": channel_id,
 
-        return
+        "added_at": datetime.utcnow()
 
-    try:
+    })
 
-        channel_id = int(
-            context.args[0]
-        )
+    await update.message.reply_text(
+        "✅ Channel Added"
+    )
 
-        exists = await channels_col.find_one({
-            "channel_id": channel_id
-        })
+except Exception as e:
 
-        if exists:
+    logger.error(e)
 
-            await update.message.reply_text(
-                "⚠ Already Added"
-            )
+    await update.message.reply_text(
+        "❌ Invalid Channel ID"
+    )
+```
 
-            return
+# ===================================
 
-        await channels_col.insert_one({
-
-            "channel_id": channel_id,
-
-            "added_at": datetime.utcnow()
-
-        })
-
-        await update.message.reply_text(
-            "✅ Channel Added"
-        )
-
-    except Exception as e:
-
-        logger.error(e)
-
-        await update.message.reply_text(
-            "❌ Invalid Channel ID"
-        )
-
-# =========================
 # SAVE POSTS
-# =========================
+
+# ===================================
 
 async def message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+update: Update,
+context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != ADMIN_ID:
+```
+try:
+
+    if (
+        ADMIN_ID != 0
+        and
+        update.effective_user.id != ADMIN_ID
+    ):
         return
 
-    try:
+    msg = update.message
 
-        msg = update.message
+    text_content = (
+        msg.text
+        or
+        msg.caption
+        or
+        ""
+    )
 
-        text_content = (
-            msg.text
-            or
-            msg.caption
-            or
-            ""
+    waiting = await msg.reply_text(
+        "⏳ Saving..."
+    )
+
+    converted_text = await convert_links(
+        text_content
+    )
+
+    duplicate = await posts_col.find_one({
+
+        "$or": [
+
+            {"text": converted_text},
+
+            {"caption": converted_text}
+
+        ]
+
+    })
+
+    if duplicate:
+
+        await waiting.edit_text(
+            "⚠ Duplicate"
         )
 
-        processing = await msg.reply_text(
-            "⏳ Processing..."
+        return
+
+    photo_id = None
+
+    if msg.photo:
+
+        photo_id = (
+            msg.photo[-1].file_id
         )
 
-        converted_text = await convert_links(
-            text_content
+    if len(converted_text) > 1024:
+
+        converted_text = (
+            converted_text[:1020]
         )
 
-        # Prevent duplicates
+    post_data = {
 
-        duplicate = await posts_col.find_one({
+        "text":
+            converted_text
+            if msg.text else None,
 
-            "$or": [
+        "caption":
+            converted_text
+            if msg.caption else None,
 
-                {"text": converted_text},
+        "photo_file_id":
+            photo_id,
 
-                {"caption": converted_text}
+        "saved_at":
+            datetime.utcnow()
 
-            ]
+    }
 
-        })
+    await posts_col.insert_one(
+        post_data
+    )
 
-        if duplicate:
+    await waiting.edit_text(
+        "✅ Saved"
+    )
 
-            await processing.edit_text(
-                "⚠ Duplicate Post"
-            )
+except Exception as e:
 
-            return
+    logger.error(e)
+```
 
-        photo_id = None
+# ===================================
 
-        if msg.photo:
-
-            photo_id = (
-                msg.photo[-1].file_id
-            )
-
-        # Telegram caption limit
-
-        if len(converted_text) > 1024:
-
-            converted_text = (
-                converted_text[:1020]
-            )
-
-        post_data = {
-
-            "text":
-                converted_text
-                if msg.text else None,
-
-            "caption":
-                converted_text
-                if msg.caption else None,
-
-            "photo_file_id":
-                photo_id,
-
-            "saved_at":
-                datetime.utcnow()
-
-        }
-
-        await posts_col.insert_one(
-            post_data
-        )
-
-        await processing.edit_text(
-            "✅ Saved"
-        )
-
-    except Exception as e:
-
-        logger.error(e)
-
-# =========================
 # AUTO POSTER
-# =========================
+
+# ===================================
 
 async def auto_post_job(app):
 
-    logger.info(
-        "Auto Posting Started"
+```
+logger.info("Scheduler Running")
+
+try:
+
+    channels = await channels_col.find().to_list(
+        length=1000
     )
 
-    try:
+    if not channels:
+        return
 
-        channels = await channels_col.find().to_list(
-            length=1000
-        )
+    posts = await posts_col.aggregate([
+        {"$sample": {"size": 20}}
+    ]).to_list(length=20)
 
-        if not channels:
+    if not posts:
+        return
 
-            logger.info("No Channels")
-            return
+    total_posts = random.randint(1,2)
 
-        posts = await posts_col.aggregate([
-            {"$sample": {"size": 20}}
-        ]).to_list(length=20)
+    three_days_ago = (
+        datetime.utcnow()
+        -
+        timedelta(days=3)
+    )
 
-        if not posts:
+    await history_col.delete_many({
 
-            logger.info("No Posts")
-            return
+        "posted_at": {
+            "$lt": three_days_ago
+        }
 
-        total_posts = random.randint(1, 2)
+    })
 
-        three_days_ago = (
-            datetime.utcnow()
-            -
-            timedelta(days=3)
-        )
+    posted = 0
 
-        # Cleanup old history
+    for post in posts:
 
-        await history_col.delete_many({
+        if posted >= total_posts:
+            break
 
-            "posted_at": {
-                "$lt": three_days_ago
-            }
+        random.shuffle(channels)
 
-        })
+        for channel in channels:
 
-        posted_count = 0
+            channel_id = (
+                channel["channel_id"]
+            )
 
-        for post in posts:
+            already = await history_col.find_one({
 
-            if posted_count >= total_posts:
+                "channel_id":
+                    channel_id,
+
+                "post_id":
+                    post["_id"],
+
+                "posted_at": {
+                    "$gte":
+                        three_days_ago
+                }
+
+            })
+
+            if already:
+                continue
+
+            try:
+
+                if post.get("photo_file_id"):
+
+                    caption = (
+                        post.get("caption")
+                        or ""
+                    )
+
+                    if len(caption) > 1024:
+                        caption = caption[:1020]
+
+                    await app.bot.send_photo(
+
+                        chat_id=channel_id,
+
+                        photo=post["photo_file_id"],
+
+                        caption=caption
+
+                    )
+
+                elif post.get("text"):
+
+                    await app.bot.send_message(
+
+                        chat_id=channel_id,
+
+                        text=post["text"]
+
+                    )
+
+                await history_col.insert_one({
+
+                    "channel_id":
+                        channel_id,
+
+                    "post_id":
+                        post["_id"],
+
+                    "posted_at":
+                        datetime.utcnow()
+
+                })
+
+                posted += 1
+
+                logger.info(
+                    f"Posted -> {channel_id}"
+                )
+
+                await asyncio.sleep(
+                    random.randint(5,10)
+                )
+
                 break
 
-            random.shuffle(channels)
+            except RetryAfter as e:
 
-            for channel in channels:
-
-                channel_id = (
-                    channel["channel_id"]
+                logger.warning(
+                    f"FloodWait {e.retry_after}"
                 )
 
-                already_posted = (
-                    await history_col.find_one({
-
-                        "channel_id":
-                            channel_id,
-
-                        "post_id":
-                            post["_id"],
-
-                        "posted_at": {
-                            "$gte":
-                                three_days_ago
-                        }
-
-                    })
+                await asyncio.sleep(
+                    e.retry_after
                 )
 
-                if already_posted:
-                    continue
+            except TelegramError as e:
 
-                try:
+                logger.error(e)
 
-                    if post.get("photo_file_id"):
+                continue
 
-                        caption = (
-                            post.get("caption")
-                            or ""
-                        )
+            except Exception as e:
 
-                        if len(caption) > 1024:
-                            caption = caption[:1020]
+                logger.error(e)
 
-                        await app.bot.send_photo(
+                continue
 
-                            chat_id=channel_id,
+except Exception as e:
 
-                            photo=post["photo_file_id"],
+    logger.error(e)
+```
 
-                            caption=caption
+# ===================================
 
-                        )
-
-                    elif post.get("text"):
-
-                        await app.bot.send_message(
-
-                            chat_id=channel_id,
-
-                            text=post["text"]
-
-                        )
-
-                    await history_col.insert_one({
-
-                        "channel_id":
-                            channel_id,
-
-                        "post_id":
-                            post["_id"],
-
-                        "posted_at":
-                            datetime.utcnow()
-
-                    })
-
-                    logger.info(
-                        f"Posted -> {channel_id}"
-                    )
-
-                    posted_count += 1
-
-                    await asyncio.sleep(
-                        random.randint(5, 12)
-                    )
-
-                    break
-
-                except RetryAfter as e:
-
-                    logger.warning(
-                        f"FloodWait {e.retry_after}"
-                    )
-
-                    await asyncio.sleep(
-                        e.retry_after
-                    )
-
-                except TelegramError as e:
-
-                    logger.error(
-                        f"Telegram Error: {e}"
-                    )
-
-                    continue
-
-                except Exception as e:
-
-                    logger.error(
-                        f"Post Error: {e}"
-                    )
-
-                    continue
-
-    except Exception as e:
-
-        logger.error(
-            f"Scheduler Error: {e}"
-        )
-
-# =========================
 # KEEP ALIVE
-# =========================
 
-async def handle_ping(request):
+# ===================================
 
-    return web.Response(
-        text="Bot Running"
-    )
+async def home(request):
 
-# =========================
+```
+return web.Response(
+    text="Bot Running"
+)
+```
+
+# ===================================
+
 # MAIN
-# =========================
+
+# ===================================
 
 async def main():
 
-    logger.info("Starting Bot...")
+```
+logger.info("Starting Bot")
 
-    await create_indexes()
+await create_indexes()
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .build()
+)
+
+app.add_handler(
+    CommandHandler(
+        "start",
+        start_cmd
     )
+)
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start_cmd
+app.add_handler(
+    CommandHandler(
+        "addchannel",
+        add_channel_cmd
+    )
+)
+
+app.add_handler(
+    MessageHandler(
+        (
+            filters.TEXT
+            |
+            filters.PHOTO
         )
+        &
+        ~filters.COMMAND,
+
+        message_handler
     )
+)
 
-    app.add_handler(
-        CommandHandler(
-            "addchannel",
-            add_channel_cmd
-        )
-    )
+await app.initialize()
 
-    app.add_handler(
-        MessageHandler(
-            (
-                filters.TEXT
-                |
-                filters.PHOTO
-            )
-            &
-            ~filters.COMMAND,
+await app.start()
 
-            message_handler
-        )
-    )
+await app.updater.start_polling()
 
-    await app.initialize()
+logger.info("Telegram Started")
 
-    await app.start()
+scheduler = AsyncIOScheduler()
 
-    await app.updater.start_polling()
+scheduler.add_job(
 
-    logger.info("Telegram Started")
+    auto_post_job,
 
-    # Scheduler
+    "interval",
 
-    scheduler = AsyncIOScheduler()
+    minutes=5,
 
-    scheduler.add_job(
+    args=[app],
 
-        auto_post_job,
+    max_instances=1
 
-        "interval",
+)
 
-        minutes=5,
+scheduler.start()
 
-        args=[app],
+logger.info("Scheduler Started")
 
-        max_instances=1
+web_app = web.Application()
 
-    )
+web_app.router.add_get(
+    "/",
+    home
+)
 
-    scheduler.start()
+runner = web.AppRunner(
+    web_app
+)
 
-    logger.info("Scheduler Started")
+await runner.setup()
 
-    # Keep Alive Web Server
+site = web.TCPSite(
+    runner,
+    "0.0.0.0",
+    PORT
+)
 
-    web_app = web.Application()
+await site.start()
 
-    web_app.router.add_get(
-        "/",
-        handle_ping
-    )
+logger.info(
+    f"Web Running : {PORT}"
+)
 
-    runner = web.AppRunner(
-        web_app
-    )
+while True:
 
-    await runner.setup()
+    await asyncio.sleep(3600)
+```
 
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT
-    )
+# ===================================
 
-    await site.start()
-
-    logger.info(
-        f"Web Server Running : {PORT}"
-    )
-
-    # Infinite loop
-
-    while True:
-
-        await asyncio.sleep(3600)
-
-# =========================
 # START
-# =========================
 
-if __name__ == "__main__":
+# ===================================
 
-    try:
+if **name** == "**main**":
 
-        asyncio.run(main())
+```
+try:
 
-    except KeyboardInterrupt:
+    asyncio.run(main())
 
-        logger.info("Bot Stopped")
+except KeyboardInterrupt:
 
-    except Exception as e:
+    logger.info("Stopped")
 
-        logger.error(e)
+except Exception as e:
+
+    logger.error(e)
 ```
