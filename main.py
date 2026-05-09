@@ -4,7 +4,6 @@ import logging
 import asyncio
 import random
 from datetime import datetime, timedelta
-from secrets import token_urlsafe
 
 from telegram import Update
 from telegram.ext import (
@@ -17,7 +16,8 @@ from telegram.ext import (
 from telegram.error import FloodWait, TelegramError
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiohttp import web  # Render port binding ke liye upayog
+from aiohttp import web
+import httpx
 
 # Logging Configuration
 logging.basicConfig(
@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 # Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-PORT = int(os.getenv("PORT", "8080")) # Render automatically assigns a port
+EARNURL_API = os.getenv("EARNURL_API")
+PORT = int(os.getenv("PORT", "8080"))
 
-if not BOT_TOKEN or not MONGO_URI:
-    raise ValueError("CRITICAL: BOT_TOKEN aur MONGO_URI environment variables set karein!")
+if not BOT_TOKEN or not MONGO_URI or not EARNURL_API:
+    raise ValueError("CRITICAL: BOT_TOKEN, MONGO_URI aur EARNURL_API variables set karein!")
 
 # MongoDB Initialization
 client = AsyncIOMotorClient(MONGO_URI)
@@ -43,14 +44,36 @@ history_col = db["history"]
 
 URL_PATTERN = re.compile(r'https?://[^\s]+')
 
-def convert_links(text: str) -> str:
-    if not text:
+async def convert_links(text: str) -> str:
+    """EarnURL API ka use karke text ke saare links ko short links me convert karta hai."""
+    if not text or not EARNURL_API:
         return text
-    def replace_url(match):
-        original_url = match.group(0)
-        random_id = token_urlsafe(6)
-        return f"earnurl.online{random_id}"
-    return URL_PATTERN.sub(replace_url, text)
+    
+    urls = URL_PATTERN.findall(text)
+    if not urls:
+        return text
+
+    async with httpx.AsyncClient() as http_client:
+        for url in urls:
+            # EarnURL shortener standard API format
+            if "earnurl.online" in url:
+                continue # Pehle se short kiye gaye links ko skip karein
+                
+            try:
+                api_url = f"earnurl.online{EARNURL_API}&url={url}"
+                response = await http_client.get(api_url, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # EarnURL JSON response handler
+                    if data.get("status") == "success" and data.get("shortenedUrl"):
+                        short_url = data["shortenedUrl"]
+                        text = text.replace(url, short_url)
+            except Exception as e:
+                logger.error(f"Link short karne me dikkat aayi: {e}")
+                continue
+                
+    return text
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -79,7 +102,11 @@ async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     text_content = msg.text or msg.caption or ""
-    updated_text = convert_links(text_content)
+    
+    # Send waiting message for heavy process
+    waiting_msg = await msg.reply_text("⏳ Links convert ho rahe hain aur post save ho rahi hai...")
+    
+    updated_text = await convert_links(text_content)
     
     post_data = {
         "text": updated_text if msg.text else None,
@@ -88,7 +115,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "saved_at": datetime.utcnow()
     }
     await posts_col.insert_one(post_data)
-    await msg.reply_text("📥 Post successfully convert aur database me save ho gayi!")
+    await waiting_msg.edit_text("📥 Post successfully convert aur database me save ho gayi!")
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Auto-posting cycle started...")
@@ -135,7 +162,6 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
             except TelegramError:
                 continue
 
-# Web Server Health Check (Render ko active rakhne ke liye)
 async def handle_ping(request):
     return web.Response(text="Bot is Alive!")
 
@@ -149,16 +175,13 @@ async def start_web_server():
     logger.info(f"Web server started on port {PORT}")
 
 async def main():
-    # Web server run karein
     await start_web_server()
 
-    # Bot Initialization
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("addchannel", add_channel_cmd))
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, message_handler))
 
-    # Scheduler Configuration
     scheduler = AsyncIOScheduler()
     scheduler.add_job(auto_post_job, "interval", minutes=5, args=[app.job_queue])
     scheduler.start()
@@ -168,7 +191,6 @@ async def main():
     await app.start()
     await app.updater.start_polling()
     
-    # Keep application alive smoothly
     while True:
         await asyncio.sleep(3600)
 
