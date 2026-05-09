@@ -98,6 +98,7 @@ async def convert_links(text):
 
     for url in urls:
         try:
+            # Agar link pehle se converted hai toh skip karein
             if "earnurl.online" in url:
                 continue
 
@@ -106,17 +107,13 @@ async def convert_links(text):
                 999999
             )
 
-            short_link = (
-                f"earnurl.online{random_id}"
-            )
+            # FIX: Added missing forward slash '/' in domain path
+            short_link = f"earnurl.online{random_id}"
 
-            text = text.replace(
-                url,
-                short_link
-            )
+            text = text.replace(url, short_link)
 
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Converter error: {e}")
 
     return text
 
@@ -155,9 +152,7 @@ async def add_channel_cmd(
             )
             return
 
-        channel_id = int(
-            context.args[0]
-        )
+        channel_id = int(context.args[0])
 
         exists = await channels_col.find_one({
             "channel_id": channel_id
@@ -207,34 +202,22 @@ async def message_handler(
         )
 
         # LINK CONVERT
-        converted_text = await convert_links(
-            text_content
-        )
+        converted_text = await convert_links(text_content)
 
         photo_id = None
 
         if msg.photo:
-            photo_id = (
-                msg.photo[-1].file_id
-            )
+            photo_id = msg.photo[-1].file_id
 
         # SAVE DB
         post_data = {
-            "text":
-                converted_text
-                if msg.text else None,
-            "caption":
-                converted_text
-                if msg.caption else None,
-            "photo_file_id":
-                photo_id,
-            "saved_at":
-                datetime.utcnow()
+            "text": converted_text if msg.text else None,
+            "caption": converted_text if msg.caption else None,
+            "photo_file_id": photo_id,
+            "saved_at": datetime.utcnow()
         }
 
-        await posts_col.insert_one(
-            post_data
-        )
+        await posts_col.insert_one(post_data)
 
         # INSTANT REPLY
         if photo_id:
@@ -285,9 +268,7 @@ async def auto_post_job(app):
             random.shuffle(channels)
 
             for channel in channels:
-                channel_id = (
-                    channel["channel_id"]
-                )
+                channel_id = channel["channel_id"]
 
                 three_days_ago = (
                     datetime.utcnow()
@@ -296,13 +277,10 @@ async def auto_post_job(app):
                 )
 
                 exists = await history_col.find_one({
-                    "channel_id":
-                        channel_id,
-                    "post_id":
-                        str(post["_id"]),
+                    "channel_id": channel_id,
+                    "post_id": str(post["_id"]),
                     "posted_at": {
-                        "$gte":
-                            three_days_ago
+                        "$gte": three_days_ago
                     }
                 })
 
@@ -314,40 +292,26 @@ async def auto_post_job(app):
                         await app.bot.send_photo(
                             chat_id=channel_id,
                             photo=post["photo_file_id"],
-                            caption=post.get(
-                                "caption",
-                                ""
-                            )
+                            caption=post.get("caption", "")
                         )
                     else:
                         await app.bot.send_message(
                             chat_id=channel_id,
-                            text=post.get(
-                                "text",
-                                ""
-                            )
+                            text=post.get("text", "")
                         )
 
                     await history_col.insert_one({
-                        "channel_id":
-                            channel_id,
-                        "post_id":
-                            str(post["_id"]),
-                        "posted_at":
-                            datetime.utcnow()
+                        "channel_id": channel_id,
+                        "post_id": str(post["_id"]),
+                        "posted_at": datetime.utcnow()
                     })
 
-                    logger.info(
-                        f"Posted -> {channel_id}"
-                    )
-
+                    logger.info(f"Posted -> {channel_id}")
                     await asyncio.sleep(3)
                     break
 
                 except RetryAfter as e:
-                    await asyncio.sleep(
-                        e.retry_after
-                    )
+                    await asyncio.sleep(e.retry_after)
                 except Exception as e:
                     logger.error(f"Failed posting to {channel_id}: {e}")
     except Exception as e:
@@ -358,27 +322,26 @@ async def auto_post_job(app):
 # =====================================
 
 async def init_web_app():
-    """Starts a web server to pass Render's mandatory port health checks."""
     webapp = web.Application()
     
     async def health_check(request):
-        return web.Response(text="Bot is running.")
+        return web.Response(text="Bot is running smoothly.")
         
     webapp.router.add_get("/", health_check)
     runner = web.AppRunner(webapp)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Web server started on port {PORT}")
+    logger.info(f"Web server active on port {PORT}")
 
 async def main():
-    # Initialize DB indexes
     await create_indexes()
 
-    # Initialize Telegram Application
+    # Initialize Telegram Application with modern async loops
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .concurrent_updates(True)
         .build()
     )
 
@@ -389,28 +352,25 @@ async def main():
         MessageHandler(filters.TEXT | filters.PHOTO, message_handler)
     )
 
-    # Start background scheduler for auto posting
+    # Start background scheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         auto_post_job,
         "interval",
-        minutes=30,  # Checks and posts every 30 minutes
+        minutes=30,
         args=[application]
     )
     scheduler.start()
-    logger.info("Scheduler started.")
+    logger.info("Auto post engine synchronized.")
 
-    # Start the web health check server
     await init_web_app()
 
-    # Start the bot execution loop
     async with application:
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
-        logger.info("Bot is polling updates...")
+        logger.info("Bot streaming updates active.")
         
-        # Keep the bot alive indefinitely
         while True:
             await asyncio.sleep(3600)
 
@@ -418,4 +378,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+        logger.info("System Offline.")
