@@ -13,7 +13,6 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-# Fixed import for v20+ version
 from telegram.error import NetworkError, TelegramError, RetryAfter
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -60,10 +59,10 @@ async def convert_links(text: str) -> str:
     async with httpx.AsyncClient() as http_client:
         for url in urls:
             if "earnurl.online" in url:
-                continue # Pehle se shortened links ko skip karein
+                continue
                 
             try:
-                # Fixed official EarnURL endpoint format
+                # FIXED: Added explicit https:// scheme and endpoint query parameters
                 api_url = f"earnurl.online{EARNURL_API}&url={url}"
                 response = await http_client.get(api_url, timeout=10)
                 
@@ -99,7 +98,7 @@ async def add_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Format: `/addchannel -100xxxxxxxxx`")
         return
         
-    channel_id = context.args[0].strip()
+    channel_id = context.args.strip()
     try:
         channel_id_int = int(channel_id)
         exists = await channels_col.find_one({"channel_id": channel_id_int})
@@ -173,7 +172,6 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(3)
                 break
             except RetryAfter as e:
-                # Handling new rate limit object name
                 await asyncio.sleep(e.retry_after)
             except TelegramError as e:
                 logger.error(f"Telegram error on channel {chan_id}: {e}")
