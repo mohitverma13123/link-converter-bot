@@ -1,405 +1,221 @@
+# main.py
 import os
 import re
-import json
 import asyncio
 import logging
-import random
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
-import certifi
-from motor.motor_asyncio import AsyncIOMotorClient
-
-from telegram import Update
+from pymongo import MongoClient
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatType, ParseMode
 from telegram.error import Conflict
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "").strip()
-MONGO_URI     = os.getenv("MONGO_URI", "").strip()
-DB_NAME       = os.getenv("DB_NAME", "earnurl_bot")
-SHORTENER_API = os.getenv("SHORTENER_API", "https://earnurl.online/api/shorten").strip()
-API_KEY       = os.getenv("EARNURL_API_KEY", "").strip()
-ADMIN_IDS     = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-AUTO_POST_SECONDS = int(os.getenv("AUTO_POST_SECONDS", "300"))
-BATCH_MIN     = int(os.getenv("BATCH_MIN", "2"))
-BATCH_MAX     = int(os.getenv("BATCH_MAX", "4"))
+BOT_TOKEN       = os.getenv("BOT_TOKEN")
+MONGO_URI       = os.getenv("MONGO_URI")
+EARNURL_API_KEY = os.getenv("EARNURL_API_KEY")
+ADMIN_IDS       = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+PORT            = int(os.getenv("PORT", "8080"))
+AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))  # 30 min default
 
-# Render Web Service PORT
-PORT = int(os.getenv("PORT", "8080"))
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("earnurl-bot")
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("bot")
 
 # ---------------- DB ----------------
-mongo = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
-db = mongo[DB_NAME]
-posts_col    = db["posts"]      # {text, links, media, status, created_at, posted_to:[chat_id]}
-channels_col = db["channels"]   # {chat_id, title, added_by, added_at}
+mongo = MongoClient(MONGO_URI)
+db = mongo["earnurl_bot"]
+posts_col    = db["posts"]      # queued posts
+channels_col = db["channels"]   # target channels
 
-# Render health server runner
-WEB_RUNNER = None
+# ---------------- EARNURL SHORTENER ----------------
+URL_RE = re.compile(r"https?://[^\s)]+", re.IGNORECASE)
 
-# ---------------- HELPERS ----------------
-URL_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
-EARNURL_RE = re.compile(r"https?://([a-z0-9-]+\.)?earnurl\.online", re.IGNORECASE)
+async def shorten_url(session: aiohttp.ClientSession, long_url: str) -> str:
+    """Shorten a single URL via earnurl.online API. Returns short url or original on failure."""
+    try:
+        api = f"https://earnurl.online/api?api={EARNURL_API_KEY}&url={long_url}"
+        async with session.get(api, timeout=15) as r:
+            data = await r.json(content_type=None)
+            if data.get("status") == "success" and data.get("shortenedUrl"):
+                return data["shortenedUrl"]
+            log.warning("earnurl failed for %s : %s", long_url, data)
+    except Exception as e:
+        log.error("shorten_url error: %s", e)
+    return long_url
 
+async def shorten_all_in_text(text: str) -> str:
+    if not text:
+        return text
+    urls = URL_RE.findall(text)
+    if not urls:
+        return text
+    async with aiohttp.ClientSession() as session:
+        for u in urls:
+            short = await shorten_url(session, u)
+            text = text.replace(u, short)
+    return text
+
+# ---------------- HANDLERS ----------------
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-def has_earnurl_link(text: str) -> bool:
-    if not text:
-        return False
-    return bool(EARNURL_RE.search(text))
-
-def extract_links(text: str):
-    if not text:
-        return []
-    return URL_RE.findall(text)
-
-async def shorten_one(session: aiohttp.ClientSession, url: str) -> str:
-    try:
-        payload = {"url": url}
-        headers = {"Content-Type": "application/json"}
-        if API_KEY:
-            headers["x-api-key"] = API_KEY
-
-        async with session.post(SHORTENER_API, json=payload, headers=headers, timeout=20) as r:
-            data = await r.json(content_type=None)
-            short = data.get("short_url") or data.get("shortUrl") or url
-            short = short.replace("earnurl.lovable.app", "earnurl.online")
-            return short
-
-    except Exception as e:
-        log.warning("shorten failed for %s: %s", url, e)
-        return url
-
-async def shorten_text(text: str) -> str:
-    links = extract_links(text)
-    if not links:
-        return text
-
-    async with aiohttp.ClientSession() as session:
-        mapping = {}
-        for u in set(links):
-            if EARNURL_RE.match(u):
-                mapping[u] = u
-            else:
-                mapping[u] = await shorten_one(session, u)
-
-    out = text
-    for orig, short in mapping.items():
-        out = out.replace(orig, short)
-
-    return out
-
-def detect_media(msg):
-    if msg.photo:
-        return "photo", msg.photo[-1].file_id
-    if msg.video:
-        return "video", msg.video.file_id
-    if msg.animation:
-        return "animation", msg.animation.file_id
-    if msg.document:
-        return "document", msg.document.file_id
-    return None, None
-
-# ---------------- HANDLERS ----------------
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
+async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE:
         return
-
     await update.message.reply_text(
-        "👋 EarnURL Bot ready.\n\nDM me any link/text/media — I’ll instantly shorten and (if admin) queue it for auto-post."
+        "👋 Send me any text/photo/video with links — I'll shorten via earnurl.online "
+        "and queue for auto-posting to your channels.\n\n"
+        "Admin commands:\n"
+        "/addchannel <@channel or -100id>\n"
+        "/removechannel <@channel or -100id>\n"
+        "/listchannels\n"
+        "/queue\n"
+        "/postnow"
     )
 
-async def cmd_addchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def add_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     if not ctx.args:
-        await update.message.reply_text("Usage: /addchannel <chat_id or @username>")
+        await update.message.reply_text("Usage: /addchannel <@channel or -100id>")
         return
+    ch = ctx.args[0]
+    channels_col.update_one({"chat_id": ch}, {"$set": {"chat_id": ch}}, upsert=True)
+    await update.message.reply_text(f"✅ Added channel: {ch}")
 
-    target = ctx.args[0]
-
-    try:
-        chat = await ctx.bot.get_chat(target)
-
-        await channels_col.update_one(
-            {"chat_id": chat.id},
-            {
-                "$set": {
-                    "chat_id": chat.id,
-                    "title": chat.title or chat.username,
-                    "added_by": update.effective_user.id,
-                    "added_at": datetime.utcnow()
-                }
-            },
-            upsert=True
-        )
-
-        await update.message.reply_text(f"✅ Added: {chat.title or chat.username} ({chat.id})")
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
-
-async def cmd_removechannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def remove_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-
     if not ctx.args:
-        await update.message.reply_text("Usage: /removechannel <chat_id>")
+        await update.message.reply_text("Usage: /removechannel <@channel or -100id>")
         return
+    ch = ctx.args[0]
+    channels_col.delete_one({"chat_id": ch})
+    await update.message.reply_text(f"🗑 Removed: {ch}")
 
-    try:
-        cid = int(ctx.args[0])
-        await channels_col.delete_one({"chat_id": cid})
-        await update.message.reply_text(f"🗑 Removed channel {cid}")
+async def list_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    chs = [c["chat_id"] for c in channels_col.find()]
+    await update.message.reply_text("Channels:\n" + ("\n".join(chs) if chs else "(none)"))
 
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+async def queue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    pending = posts_col.count_documents({"posted": False})
+    posted  = posts_col.count_documents({"posted": True})
+    await update.message.reply_text(f"📦 Pending: {pending}\n✅ Posted: {posted}")
 
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def postnow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    n = await autopost_once(ctx.application)
+    await update.message.reply_text(f"📤 Posted {n} item(s).")
+
+async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receive content in DM, convert links, save to queue."""
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
     if not is_admin(update.effective_user.id):
         return
 
-    pending = await posts_col.count_documents({"status": "pending"})
-    posted  = await posts_col.count_documents({"status": "posted"})
-    chans   = await channels_col.count_documents({})
-
-    await update.message.reply_text(
-        f"📊 Stats\nPending: {pending}\nPosted: {posted}\nChannels: {chans}"
-    )
-
-async def cmd_reset_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    res = await posts_col.update_many({}, {"$set": {"status": "pending", "posted_to": []}})
-    await update.message.reply_text(f"♻️ Reset {res.modified_count} posts to pending.")
-
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-
-    # STRICT: private chat only. Ignore groups/channels even if user is admin.
-    if chat.type != "private":
-        return
-
-    if not msg:
-        return
-
+    msg = update.message
     text = msg.text or msg.caption or ""
-    media_type, file_id = detect_media(msg)
+    converted = await shorten_all_in_text(text)
 
-    # If no link and no media -> ignore silently
-    links = extract_links(text)
-    if not links and not media_type:
-        return
-
-    # Skip if message already contains an earnurl.online link -> no convert, no reply
-    if has_earnurl_link(text):
-        log.info("Skipping message with existing earnurl.online link from user %s", msg.from_user.id)
-        return
-
-    # Convert
-    converted = await shorten_text(text) if links else text
-
-    # Reply instantly
-    try:
-        if media_type == "photo" and file_id:
-            await msg.reply_photo(photo=file_id, caption=converted[:1024] if converted else None)
-
-        elif media_type == "video" and file_id:
-            await msg.reply_video(video=file_id, caption=converted[:1024] if converted else None)
-
-        elif media_type == "animation" and file_id:
-            await msg.reply_animation(animation=file_id, caption=converted[:1024] if converted else None)
-
-        elif media_type == "document" and file_id:
-            await msg.reply_document(document=file_id, caption=converted[:1024] if converted else None)
-
-        else:
-            await msg.reply_text(converted or "(no text)")
-
-    except Exception as e:
-        log.warning("reply failed: %s", e)
-
-    # Save to queue: ALL private DMs that had a link OR media
-    try:
-        await posts_col.insert_one({
-            "text": converted,
-            "original_text": text,
-            "media_type": media_type,
-            "file_id": file_id,
-            "from_user": msg.from_user.id,
-            "status": "pending",
-            "posted_to": [],
-            "created_at": datetime.utcnow(),
-        })
-
-        log.info("Queued post from user %s (media=%s)", msg.from_user.id, media_type)
-
-    except Exception as e:
-        log.error("queue insert failed: %s", e)
-
-# ---------------- AUTO POST ----------------
-async def send_post_to_channel(bot, chat_id: int, post: dict):
-    text = post.get("text") or ""
-    mtype = post.get("media_type")
-    fid = post.get("file_id")
-
-    try:
-        if mtype == "photo" and fid:
-            await bot.send_photo(chat_id, photo=fid, caption=text[:1024])
-
-        elif mtype == "video" and fid:
-            await bot.send_video(chat_id, video=fid, caption=text[:1024])
-
-        elif mtype == "animation" and fid:
-            await bot.send_animation(chat_id, animation=fid, caption=text[:1024])
-
-        elif mtype == "document" and fid:
-            await bot.send_document(chat_id, document=fid, caption=text[:1024])
-
-        else:
-            await bot.send_message(chat_id, text or "(empty)")
-
-        return True
-
-    except Exception as e:
-        log.warning("send to %s failed: %s", chat_id, e)
-        return False
-
-async def auto_post_job(ctx: ContextTypes.DEFAULT_TYPE):
-    bot = ctx.bot
-
-    channels = [c async for c in channels_col.find({})]
-    if not channels:
-        return
-
-    batch_size = random.randint(BATCH_MIN, BATCH_MAX)
-
-    pending = [p async for p in posts_col.find({"status": "pending"}).limit(batch_size)]
-
-    if not pending:
-        # Recycle: oldest posted -> reset to pending
-        old = [
-            p async for p in posts_col
-            .find({"status": "posted"})
-            .sort("created_at", 1)
-            .limit(batch_size)
-        ]
-
-        if not old:
-            return
-
-        ids = [p["_id"] for p in old]
-
-        await posts_col.update_many(
-            {"_id": {"$in": ids}},
-            {"$set": {"status": "pending", "posted_to": []}}
-        )
-
-        pending = [p async for p in posts_col.find({"_id": {"$in": ids}})]
-
-    for post in pending:
-        sent_to = []
-
-        for ch in channels:
-            ok = await send_post_to_channel(bot, ch["chat_id"], post)
-
-            if ok:
-                sent_to.append(ch["chat_id"])
-
-            await asyncio.sleep(0.5)
-
-        await posts_col.update_one(
-            {"_id": post["_id"]},
-            {
-                "$set": {
-                    "status": "posted",
-                    "posted_to": sent_to,
-                    "last_posted_at": datetime.utcnow()
-                }
-            }
-        )
-
-        log.info("Auto-posted %s to %d channels", post["_id"], len(sent_to))
-
-# ---------------- RENDER HEALTH SERVER ----------------
-async def health_check(request):
-    """
-    Render Web Service ko alive dikhane ke liye HTTP endpoint.
-    Bot functionality ko change nahi karta.
-    """
-
-    data = {
-        "ok": True,
-        "service": "earnurl-telegram-bot",
-        "time": datetime.utcnow().isoformat() + "Z",
+    doc = {
+        "text": converted,
+        "photo": msg.photo[-1].file_id if msg.photo else None,
+        "video": msg.video.file_id if msg.video else None,
+        "document": msg.document.file_id if msg.document else None,
+        "posted": False,
+        "created_at": datetime.now(timezone.utc),
     }
+    posts_col.insert_one(doc)
+    await msg.reply_text("✅ Converted & queued for auto-post.")
 
+# ---------------- AUTOPOST ----------------
+async def autopost_once(app: Application) -> int:
+    channels = [c["chat_id"] for c in channels_col.find()]
+    if not channels:
+        return 0
+    posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(1))
+    sent = 0
+    for post in posts:
+        for ch in channels:
+            try:
+                if post.get("photo"):
+                    await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
+                elif post.get("video"):
+                    await app.bot.send_video(ch, post["video"], caption=post.get("text") or "")
+                elif post.get("document"):
+                    await app.bot.send_document(ch, post["document"], caption=post.get("text") or "")
+                else:
+                    await app.bot.send_message(ch, post.get("text") or "", disable_web_page_preview=False)
+            except Exception as e:
+                log.error("send to %s failed: %s", ch, e)
+        posts_col.update_one({"_id": post["_id"]}, {"$set": {"posted": True, "posted_at": datetime.now(timezone.utc)}})
+        sent += 1
+    return sent
+
+async def autopost_loop(app: Application):
+    while True:
+        try:
+            n = await autopost_once(app)
+            if n:
+                log.info("autopost sent %d", n)
+        except Exception as e:
+            log.error("autopost error: %s", e)
+        await asyncio.sleep(AUTOPOST_INTERVAL)
+
+# ---------------- HEALTH SERVER (Render port bind) ----------------
+async def health(_req):
     try:
-        data["pending"] = await posts_col.count_documents({"status": "pending"})
-        data["posted"] = await posts_col.count_documents({"status": "posted"})
-        data["channels"] = await channels_col.count_documents({})
+        pending = posts_col.count_documents({"posted": False})
+        posted  = posts_col.count_documents({"posted": True})
+        chs     = channels_col.count_documents({})
+    except Exception:
+        pending = posted = chs = -1
+    return web.json_response({"ok": True, "pending": pending, "posted": posted, "channels": chs})
 
-    except Exception as e:
-        # Health endpoint ko fail nahi karna, warna Render service restart kar sakta hai.
-        data["db_warning"] = str(e)
-
-    return web.json_response(data)
-
-async def start_health_server(application):
-    global WEB_RUNNER
-
+async def start_health_server(app: Application):
     web_app = web.Application()
-    web_app.router.add_get("/", health_check)
-    web_app.router.add_get("/health", health_check)
-
-    WEB_RUNNER = web.AppRunner(web_app)
-    await WEB_RUNNER.setup()
-
-    site = web.TCPSite(WEB_RUNNER, "0.0.0.0", PORT)
+    web_app.router.add_get("/", health)
+    web_app.router.add_get("/health", health)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    app.bot_data["_health_runner"] = runner
+    log.info("Health server listening on :%d", PORT)
+    # also start autopost loop
+    app.bot_data["_autopost_task"] = asyncio.create_task(autopost_loop(app))
 
-    log.info("Health server listening on 0.0.0.0:%s", PORT)
+async def stop_health_server(app: Application):
+    runner = app.bot_data.get("_health_runner")
+    if runner:
+        await runner.cleanup()
+    task = app.bot_data.get("_autopost_task")
+    if task:
+        task.cancel()
 
-    # Polling mode use kar rahe hain, isliye old webhook clear.
-    # Ye functionality change nahi karta; sirf polling startup clean rakhta hai.
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Telegram webhook cleared before polling startup")
-    except Exception as e:
-        log.warning("delete_webhook failed: %s", e)
-
-async def stop_health_server(application):
-    global WEB_RUNNER
-
-    if WEB_RUNNER:
-        await WEB_RUNNER.cleanup()
-        WEB_RUNNER = None
-
-    log.info("Health server stopped")
-
-# ---------------- ERROR HANDLER ----------------
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+# ---------------- ERRORS ----------------
+async def error_handler(update, ctx):
     err = ctx.error
-
     if isinstance(err, Conflict):
-        log.error(
-            "Telegram 409 Conflict: same BOT_TOKEN se another polling instance already running hai. "
-            "Local bot / old Render service / duplicate worker ko stop karo."
-        )
+        log.error("409 Conflict: another instance is polling with the same BOT_TOKEN. "
+                  "Stop the old/local bot or delete the old Render service.")
         return
-
-    log.exception("Unhandled bot error", exc_info=err)
+    log.exception("Unhandled error: %s", err)
 
 # ---------------- MAIN ----------------
 def main():
@@ -407,36 +223,23 @@ def main():
         raise SystemExit("BOT_TOKEN missing")
 
     app = (
-        ApplicationBuilder()
+        Application.builder()
         .token(BOT_TOKEN)
         .post_init(start_health_server)
         .post_shutdown(stop_health_server)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
-    app.add_handler(CommandHandler("removechannel", cmd_removechannel))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("reset_queue", cmd_reset_queue))
-
-    # PRIVATE ONLY — group messages completely ignored
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_message
-    ))
-
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("addchannel", add_channel))
+    app.add_handler(CommandHandler("removechannel", remove_channel))
+    app.add_handler(CommandHandler("listchannels", list_channels))
+    app.add_handler(CommandHandler("queue", queue_cmd))
+    app.add_handler(CommandHandler("postnow", postnow_cmd))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_message))
     app.add_error_handler(error_handler)
 
-    # Schedule auto-post
-    app.job_queue.run_repeating(auto_post_job, interval=AUTO_POST_SECONDS, first=30)
-
-    log.info("Bot starting polling with Render health server...")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
