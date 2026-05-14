@@ -1,50 +1,64 @@
-# main.py
 import os
 import re
 import asyncio
 import logging
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
 from pymongo import MongoClient
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatType, ParseMode
+from telegram import Update
+from telegram.constants import ChatType
 from telegram.error import Conflict
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    Application, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN       = os.getenv("BOT_TOKEN")
-MONGO_URI       = os.getenv("MONGO_URI")
-EARNURL_API_KEY = os.getenv("EARNURL_API_KEY")
-ADMIN_IDS       = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-PORT            = int(os.getenv("PORT", "8080"))
-AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))  # 30 min default
+BOT_TOKEN       = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URI       = os.getenv("MONGO_URI", "").strip()
+EARNURL_API_KEY = (os.getenv("EARNURL_API_KEY") or os.getenv("EARNURL_API") or "").strip()
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
+_admins_raw = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or ""
+ADMIN_IDS = [int(x) for x in re.split(r"[,\s]+", _admins_raw) if x.strip().lstrip("-").isdigit()]
+
+PORT              = int(os.getenv("PORT", "8080"))
+AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))
+
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
+
+log.info("Boot config -> admins=%s earnurl_key_set=%s mongo_set=%s",
+         ADMIN_IDS, bool(EARNURL_API_KEY), bool(MONGO_URI))
 
 # ---------------- DB ----------------
 mongo = MongoClient(MONGO_URI)
 db = mongo["earnurl_bot"]
-posts_col    = db["posts"]      # queued posts
-channels_col = db["channels"]   # target channels
+posts_col    = db["posts"]
+channels_col = db["channels"]
 
 # ---------------- EARNURL SHORTENER ----------------
-URL_RE = re.compile(r"https?://[^\s)]+", re.IGNORECASE)
+URL_RE     = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
+EARNURL_RE = re.compile(r"https?://([a-z0-9-]+\.)?earnurl\.online", re.IGNORECASE)
 
 async def shorten_url(session: aiohttp.ClientSession, long_url: str) -> str:
-    """Shorten a single URL via earnurl.online API. Returns short url or original on failure."""
+    if EARNURL_RE.search(long_url):
+        return long_url
+    if not EARNURL_API_KEY:
+        log.error("EARNURL_API_KEY missing — cannot shorten")
+        return long_url
     try:
-        api = f"https://earnurl.online/api?api={EARNURL_API_KEY}&url={long_url}"
-        async with session.get(api, timeout=15) as r:
-            data = await r.json(content_type=None)
+        api = f"https://earnurl.online/api?api={EARNURL_API_KEY}&url={quote(long_url, safe='')}"
+        async with session.get(api, timeout=20) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
+                txt = await r.text()
+                log.warning("earnurl non-json (%s): %s", r.status, txt[:200])
+                return long_url
+            log.info("earnurl resp: %s", data)
             if data.get("status") == "success" and data.get("shortenedUrl"):
                 return data["shortenedUrl"]
             log.warning("earnurl failed for %s : %s", long_url, data)
@@ -61,11 +75,14 @@ async def shorten_all_in_text(text: str) -> str:
     async with aiohttp.ClientSession() as session:
         for u in urls:
             short = await shorten_url(session, u)
-            text = text.replace(u, short)
+            if short and short != u:
+                text = text.replace(u, short)
     return text
 
 # ---------------- HANDLERS ----------------
 def is_admin(uid: int) -> bool:
+    if not ADMIN_IDS:
+        return True
     return uid in ADMIN_IDS
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -74,6 +91,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Send me any text/photo/video with links — I'll shorten via earnurl.online "
         "and queue for auto-posting to your channels.\n\n"
+        f"Your user id: {update.effective_user.id}\n\n"
         "Admin commands:\n"
         "/addchannel <@channel or -100id>\n"
         "/removechannel <@channel or -100id>\n"
@@ -82,15 +100,37 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/postnow"
     )
 
+def _normalize_channel(ch: str):
+    ch = ch.strip()
+    if re.fullmatch(r"-?\d+", ch):
+        return int(ch)
+    if not ch.startswith("@"):
+        ch = "@" + ch
+    return ch
+
 async def add_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not admin. Your id: " + str(update.effective_user.id))
         return
     if not ctx.args:
         await update.message.reply_text("Usage: /addchannel <@channel or -100id>")
         return
-    ch = ctx.args[0]
-    channels_col.update_one({"chat_id": ch}, {"$set": {"chat_id": ch}}, upsert=True)
-    await update.message.reply_text(f"✅ Added channel: {ch}")
+    ch = _normalize_channel(ctx.args[0])
+    try:
+        chat = await ctx.bot.get_chat(ch)
+        ch_id = chat.id
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Couldn't access {ch}. Make the bot an admin in that channel first.\nError: {e}"
+        )
+        return
+    channels_col.update_one(
+        {"chat_id": ch_id},
+        {"$set": {"chat_id": ch_id, "title": getattr(chat, 'title', None),
+                  "added_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    await update.message.reply_text(f"✅ Added channel: {chat.title or ch_id} ({ch_id})")
 
 async def remove_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -98,22 +138,34 @@ async def remove_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage: /removechannel <@channel or -100id>")
         return
-    ch = ctx.args[0]
-    channels_col.delete_one({"chat_id": ch})
-    await update.message.reply_text(f"🗑 Removed: {ch}")
+    ch = _normalize_channel(ctx.args[0])
+    try:
+        chat = await ctx.bot.get_chat(ch)
+        ch_id = chat.id
+    except Exception:
+        ch_id = ch
+    res = channels_col.delete_one({"chat_id": ch_id})
+    await update.message.reply_text(f"🗑 Removed: {ch_id} (deleted={res.deleted_count})")
 
 async def list_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    chs = [c["chat_id"] for c in channels_col.find()]
-    await update.message.reply_text("Channels:\n" + ("\n".join(chs) if chs else "(none)"))
+    chs = list(channels_col.find())
+    if not chs:
+        await update.message.reply_text("Channels: (none)")
+        return
+    lines = [f"• {c.get('title') or ''} {c['chat_id']}" for c in chs]
+    await update.message.reply_text("Channels:\n" + "\n".join(lines))
 
 async def queue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     pending = posts_col.count_documents({"posted": False})
     posted  = posts_col.count_documents({"posted": True})
-    await update.message.reply_text(f"📦 Pending: {pending}\n✅ Posted: {posted}")
+    chs     = channels_col.count_documents({})
+    await update.message.reply_text(
+        f"📦 Pending: {pending}\n✅ Posted: {posted}\n📡 Channels: {chs}"
+    )
 
 async def postnow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -122,7 +174,6 @@ async def postnow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📤 Posted {n} item(s).")
 
 async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive content in DM, convert links, save to queue."""
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     if not is_admin(update.effective_user.id):
@@ -130,7 +181,9 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     msg = update.message
     text = msg.text or msg.caption or ""
-    converted = await shorten_all_in_text(text)
+
+    has_url = bool(URL_RE.search(text))
+    converted = await shorten_all_in_text(text) if has_url else text
 
     doc = {
         "text": converted,
@@ -141,14 +194,34 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         "created_at": datetime.now(timezone.utc),
     }
     posts_col.insert_one(doc)
-    await msg.reply_text("✅ Converted & queued for auto-post.")
+
+    try:
+        if doc["photo"]:
+            await msg.reply_photo(doc["photo"], caption=converted or None)
+        elif doc["video"]:
+            await msg.reply_video(doc["video"], caption=converted or None)
+        elif doc["document"]:
+            await msg.reply_document(doc["document"], caption=converted or None)
+        else:
+            await msg.reply_text(converted or "(no text)", disable_web_page_preview=False)
+    except Exception as e:
+        log.warning("reply failed: %s", e)
+
+    note = "✅ Converted & queued." if has_url else "✅ Queued (no links to shorten)."
+    if has_url and converted == text:
+        note = "⚠️ Queued, but shortener didn't return a short link. Check EARNURL_API_KEY in Render env vars."
+    await msg.reply_text(note)
 
 # ---------------- AUTOPOST ----------------
 async def autopost_once(app: Application) -> int:
     channels = [c["chat_id"] for c in channels_col.find()]
     if not channels:
+        log.info("autopost: no channels")
         return 0
     posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(1))
+    if not posts:
+        log.info("autopost: no pending posts")
+        return 0
     sent = 0
     for post in posts:
         for ch in channels:
@@ -163,7 +236,10 @@ async def autopost_once(app: Application) -> int:
                     await app.bot.send_message(ch, post.get("text") or "", disable_web_page_preview=False)
             except Exception as e:
                 log.error("send to %s failed: %s", ch, e)
-        posts_col.update_one({"_id": post["_id"]}, {"$set": {"posted": True, "posted_at": datetime.now(timezone.utc)}})
+        posts_col.update_one(
+            {"_id": post["_id"]},
+            {"$set": {"posted": True, "posted_at": datetime.now(timezone.utc)}},
+        )
         sent += 1
     return sent
 
@@ -177,7 +253,7 @@ async def autopost_loop(app: Application):
             log.error("autopost error: %s", e)
         await asyncio.sleep(AUTOPOST_INTERVAL)
 
-# ---------------- HEALTH SERVER (Render port bind) ----------------
+# ---------------- HEALTH SERVER ----------------
 async def health(_req):
     try:
         pending = posts_col.count_documents({"posted": False})
@@ -197,7 +273,6 @@ async def start_health_server(app: Application):
     await site.start()
     app.bot_data["_health_runner"] = runner
     log.info("Health server listening on :%d", PORT)
-    # also start autopost loop
     app.bot_data["_autopost_task"] = asyncio.create_task(autopost_loop(app))
 
 async def stop_health_server(app: Application):
@@ -212,8 +287,7 @@ async def stop_health_server(app: Application):
 async def error_handler(update, ctx):
     err = ctx.error
     if isinstance(err, Conflict):
-        log.error("409 Conflict: another instance is polling with the same BOT_TOKEN. "
-                  "Stop the old/local bot or delete the old Render service.")
+        log.error("409 Conflict: another instance is polling with the same BOT_TOKEN.")
         return
     log.exception("Unhandled error: %s", err)
 
