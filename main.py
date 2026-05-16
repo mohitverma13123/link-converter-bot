@@ -222,17 +222,40 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 # ---------------- AUTOPOST ----------------
 async def autopost_once(app: Application) -> int:
+    # 1. Saare channels ki list nikalein
     channels = [c["chat_id"] for c in channels_col.find()]
     if not channels:
         log.info("autopost: no channels")
         return 0
-    posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(1))
+
+    # 2. Jitne channels hain, utni pending posts database se nikaalein (limit hatayi ya channels ke barabar ki)
+    # Humne .limit(len(channels)) kar diya hai taaki har channel ke liye alag post mil sake
+    posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(len(channels)))
     if not posts:
         log.info("autopost: no pending posts")
         return 0
+
     sent = 0
-    for post in posts:
-        for ch in channels:
+    
+    # 3. Double loop hatakar dono ko sath mein chalayein (zip use karke)
+    # Isse Channel 1 ko Post 1 milegi, Channel 2 ko Post 2 milegi
+    for ch, post in zip(channels, posts):
+        try:
+            if post.get("photo"):
+                await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
+            elif post.get("video"):
+                await app.bot.send_video(ch, post["video"], caption=post.get("text") or "")
+            else:
+                await app.bot.send_message(ch, text=post.get("text") or "")
+            
+            # Post bhejte hi use database mein True mark karein taaki woh dobara na repeat ho
+            posts_col.update_one({"_id": post["_id"]}, {"$set": {"posted": True}})
+            sent += 1
+            
+        except Exception as e:
+            log.error(f"Error sending to channel {ch}: {e}")
+            
+    return sent
             try:
                 if post.get("photo"):
                     await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
