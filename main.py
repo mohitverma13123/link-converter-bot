@@ -265,7 +265,38 @@ async def autopost_once(app: Application) -> int:
         )
         sent += 1
     return sent
+async def autopost_once(app: Application) -> int:
+    channels = [c["chat_id"] for c in channels_col.find()]
+    if not channels:
+        log.info("autopost: no channels")
+        return 0
 
+    posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(len(channels)))
+    if not posts:
+        log.info("autopost: no pending posts")
+        return 0
+
+    sent = 0
+    for ch, post in zip(channels, posts):
+        try:
+            if post.get("photo"):
+                await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
+            elif post.get("video"):
+                await app.bot.send_video(ch, post["video"], caption=post.get("text") or "")
+            elif post.get("document"):
+                await app.bot.send_document(ch, post["document"], caption=post.get("text") or "")
+            else:
+                await app.bot.send_message(ch, text=post.get("text") or "", disable_web_page_preview=False)
+            
+            posts_col.update_one(
+                {"_id": post["_id"]},
+                {"$set": {"posted": True, "posted_at": datetime.now(timezone.utc)}},
+            )
+            sent += 1
+        except Exception as e:
+            log.error("send to %s failed: %s", ch, e)
+            
+    return sent
 async def autopost_loop(app: Application):
     while True:
         try:
