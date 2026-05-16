@@ -2,7 +2,6 @@ import os
 import re
 import asyncio
 import logging
-from urllib.parse import quote
 from datetime import datetime, timezone
 
 import aiohttp
@@ -21,17 +20,25 @@ BOT_TOKEN       = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URI       = os.getenv("MONGO_URI", "").strip()
 EARNURL_API_KEY = (os.getenv("EARNURL_API_KEY") or os.getenv("EARNURL_API") or "").strip()
 
+SHORTEN_ENDPOINT = os.getenv(
+    "SHORTEN_ENDPOINT",
+    "https://mgtvdesmjqqrgczgvnbz.supabase.co/functions/v1/shorten-api",
+).strip()
+
 _admins_raw = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or ""
 ADMIN_IDS = [int(x) for x in re.split(r"[,\s]+", _admins_raw) if x.strip().lstrip("-").isdigit()]
 
 PORT              = int(os.getenv("PORT", "8080"))
-AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))
+AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))  # 30 min
 
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
 log = logging.getLogger("bot")
 
-log.info("Boot config -> admins=%s earnurl_key_set=%s mongo_set=%s",
-         ADMIN_IDS, bool(EARNURL_API_KEY), bool(MONGO_URI))
+log.info("Boot config -> admins=%s earnurl_key_set=%s mongo_set=%s endpoint=%s",
+         ADMIN_IDS, bool(EARNURL_API_KEY), bool(MONGO_URI), SHORTEN_ENDPOINT)
 
 # ---------------- DB ----------------
 mongo = MongoClient(MONGO_URI)
@@ -39,29 +46,30 @@ db = mongo["earnurl_bot"]
 posts_col    = db["posts"]
 channels_col = db["channels"]
 
-# ---------------- EARNURL SHORTENER ----------------
+# ---------------- SHORTENER ----------------
 URL_RE     = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
 EARNURL_RE = re.compile(r"https?://([a-z0-9-]+\.)?earnurl\.online", re.IGNORECASE)
 
 async def shorten_url(session: aiohttp.ClientSession, long_url: str) -> str:
+    """Shorten via Supabase shorten-api edge function. Skip already-earnurl links."""
     if EARNURL_RE.search(long_url):
         return long_url
     if not EARNURL_API_KEY:
         log.error("EARNURL_API_KEY missing — cannot shorten")
         return long_url
     try:
-        api = f"https://earnurl.online/api?api={EARNURL_API_KEY}&url={quote(long_url, safe='')}"
-        async with session.get(api, timeout=20) as r:
+        params = {"api": EARNURL_API_KEY, "url": long_url, "mode": "quick"}
+        async with session.get(SHORTEN_ENDPOINT, params=params, timeout=20) as r:
             try:
                 data = await r.json(content_type=None)
             except Exception:
                 txt = await r.text()
-                log.warning("earnurl non-json (%s): %s", r.status, txt[:200])
+                log.warning("shorten non-json (%s): %s", r.status, txt[:200])
                 return long_url
-            log.info("earnurl resp: %s", data)
-            if data.get("status") == "success" and data.get("shortenedUrl"):
-                return data["shortenedUrl"]
-            log.warning("earnurl failed for %s : %s", long_url, data)
+            log.info("shorten resp: %s", data)
+            if data.get("ok") and data.get("short_url"):
+                return data["short_url"]
+            log.warning("shorten failed for %s : %s", long_url, data)
     except Exception as e:
         log.error("shorten_url error: %s", e)
     return long_url
@@ -264,6 +272,13 @@ async def health(_req):
     return web.json_response({"ok": True, "pending": pending, "posted": posted, "channels": chs})
 
 async def start_health_server(app: Application):
+    # Force-clear any leftover webhook so getUpdates won't 409
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook cleared on startup")
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
+
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
