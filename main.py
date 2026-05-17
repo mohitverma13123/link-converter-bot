@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -20,11 +21,6 @@ BOT_TOKEN       = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URI       = os.getenv("MONGO_URI", "").strip()
 EARNURL_API_KEY = (os.getenv("EARNURL_API_KEY") or os.getenv("EARNURL_API") or "").strip()
 
-SHORTEN_ENDPOINT = os.getenv(
-    "SHORTEN_ENDPOINT",
-    "https://mgtvdesmjqqrgczgvnbz.supabase.co/functions/v1/shorten-api",
-).strip()
-
 _admins_raw = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or ""
 ADMIN_IDS = [int(x) for x in re.split(r"[,\s]+", _admins_raw) if x.strip().lstrip("-").isdigit()]
 
@@ -37,8 +33,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-log.info("Boot config -> admins=%s earnurl_key_set=%s mongo_set=%s endpoint=%s",
-         ADMIN_IDS, bool(EARNURL_API_KEY), bool(MONGO_URI), SHORTEN_ENDPOINT)
+log.info("Boot -> admins=%s earnurl_key_set=%s mongo_set=%s",
+         ADMIN_IDS, bool(EARNURL_API_KEY), bool(MONGO_URI))
+
+if not MONGO_URI:
+    raise SystemExit("MONGO_URI missing! Without it the bot forgets channels/posts on every deploy.")
 
 # ---------------- DB ----------------
 mongo = MongoClient(MONGO_URI)
@@ -46,16 +45,23 @@ db = mongo["earnurl_bot"]
 posts_col    = db["posts"]
 channels_col = db["channels"]
 
-# ---------------- SHORTENER ----------------
+posts_col.create_index("sent_to")
+channels_col.create_index("chat_id", unique=True)
+
+# ---------------- EARNURL SHORTENER ----------------
 URL_RE     = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
 EARNURL_RE = re.compile(r"https?://([a-z0-9-]+\.)?earnurl\.online", re.IGNORECASE)
 
+SHORTEN_ENDPOINT = os.getenv(
+    "SHORTEN_ENDPOINT",
+    "https://mgtvdesmjqqrgczgvnbz.supabase.co/functions/v1/shorten-api",
+).strip()
+
 async def shorten_url(session: aiohttp.ClientSession, long_url: str) -> str:
-    """Shorten via Supabase shorten-api edge function. Skip already-earnurl links."""
     if EARNURL_RE.search(long_url):
         return long_url
     if not EARNURL_API_KEY:
-        log.error("EARNURL_API_KEY missing — cannot shorten")
+        log.error("EARNURL_API_KEY missing")
         return long_url
     try:
         params = {"api": EARNURL_API_KEY, "url": long_url, "mode": "quick"}
@@ -63,13 +69,12 @@ async def shorten_url(session: aiohttp.ClientSession, long_url: str) -> str:
             try:
                 data = await r.json(content_type=None)
             except Exception:
-                txt = await r.text()
-                log.warning("shorten non-json (%s): %s", r.status, txt[:200])
                 return long_url
-            log.info("shorten resp: %s", data)
             if data.get("ok") and data.get("short_url"):
                 return data["short_url"]
-            log.warning("shorten failed for %s : %s", long_url, data)
+            if data.get("status") == "success" and data.get("shortenedUrl"):
+                return data["shortenedUrl"]
+            log.warning("shorten failed: %s", data)
     except Exception as e:
         log.error("shorten_url error: %s", e)
     return long_url
@@ -97,15 +102,11 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     await update.message.reply_text(
-        "👋 Send me any text/photo/video with links — I'll shorten via earnurl.online "
-        "and queue for auto-posting to your channels.\n\n"
+        "👋 Send any text/photo/video with links — I'll shorten and queue.\n"
         f"Your user id: {update.effective_user.id}\n\n"
-        "Admin commands:\n"
         "/addchannel <@channel or -100id>\n"
         "/removechannel <@channel or -100id>\n"
-        "/listchannels\n"
-        "/queue\n"
-        "/postnow"
+        "/listchannels\n/queue\n/postnow"
     )
 
 def _normalize_channel(ch: str):
@@ -128,9 +129,7 @@ async def add_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat = await ctx.bot.get_chat(ch)
         ch_id = chat.id
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Couldn't access {ch}. Make the bot an admin in that channel first.\nError: {e}"
-        )
+        await update.message.reply_text(f"❌ Couldn't access {ch}. Make the bot admin there.\n{e}")
         return
     channels_col.update_one(
         {"chat_id": ch_id},
@@ -138,7 +137,7 @@ async def add_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   "added_at": datetime.now(timezone.utc)}},
         upsert=True,
     )
-    await update.message.reply_text(f"✅ Added channel: {chat.title or ch_id} ({ch_id})")
+    await update.message.reply_text(f"✅ Added: {chat.title or ch_id} ({ch_id})")
 
 async def remove_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -168,18 +167,15 @@ async def list_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def queue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    pending = posts_col.count_documents({"posted": False})
-    posted  = posts_col.count_documents({"posted": True})
-    chs     = channels_col.count_documents({})
-    await update.message.reply_text(
-        f"📦 Pending: {pending}\n✅ Posted: {posted}\n📡 Channels: {chs}"
-    )
+    total = posts_col.count_documents({})
+    chs   = channels_col.count_documents({})
+    await update.message.reply_text(f"📦 Posts in pool: {total}\n📡 Channels: {chs}")
 
 async def postnow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     n = await autopost_once(ctx.application)
-    await update.message.reply_text(f"📤 Posted {n} item(s).")
+    await update.message.reply_text(f"📤 Sent to {n} channel(s).")
 
 async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -189,16 +185,14 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     msg = update.message
     text = msg.text or msg.caption or ""
-
-    has_url = bool(URL_RE.search(text))
-    converted = await shorten_all_in_text(text) if has_url else text
+    converted = await shorten_all_in_text(text) if URL_RE.search(text) else text
 
     doc = {
         "text": converted,
         "photo": msg.photo[-1].file_id if msg.photo else None,
         "video": msg.video.file_id if msg.video else None,
         "document": msg.document.file_id if msg.document else None,
-        "posted": False,
+        "sent_to": [],
         "created_at": datetime.now(timezone.utc),
     }
     posts_col.insert_one(doc)
@@ -215,116 +209,88 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         log.warning("reply failed: %s", e)
 
-    note = "✅ Converted & queued." if has_url else "✅ Queued (no links to shorten)."
-    if has_url and converted == text:
-        note = "⚠️ Queued, but shortener didn't return a short link. Check EARNURL_API_KEY in Render env vars."
-    await msg.reply_text(note)
-
 # ---------------- AUTOPOST ----------------
+async def _send_post(app: Application, ch_id, post) -> bool:
+    try:
+        if post.get("photo"):
+            await app.bot.send_photo(ch_id, post["photo"], caption=post.get("text") or "")
+        elif post.get("video"):
+            await app.bot.send_video(ch_id, post["video"], caption=post.get("text") or "")
+        elif post.get("document"):
+            await app.bot.send_document(ch_id, post["document"], caption=post.get("text") or "")
+        else:
+            await app.bot.send_message(ch_id, post.get("text") or "", disable_web_page_preview=False)
+        return True
+    except Exception as e:
+        log.error("send to %s failed: %s", ch_id, e)
+        return False
+
 async def autopost_once(app: Application) -> int:
-    channels = [c["chat_id"] for c in channels_col.find()]
+    channels = list(channels_col.find())
     if not channels:
         log.info("autopost: no channels")
         return 0
 
-    posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(len(channels)))
-    if not posts:
-        log.info("autopost: no pending posts")
+    if posts_col.count_documents({}) == 0:
+        log.info("autopost: pool empty")
         return 0
 
-    sent = 0
-    for ch, post in zip(channels, posts):
-        try:
-            if post.get("photo"):
-                await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
-            elif post.get("video"):
-                await app.bot.send_video(ch, post["video"], caption=post.get("text") or "")
-            else:
-                await app.bot.send_message(ch, text=post.get("text") or "")
-            
-            posts_col.update_one({"_id": post["_id"]}, {"$set": {"posted": True}})
-            sent += 1
-        except Exception as e:
-            log.error(f"Error sending to channel {ch}: {e}")
-            
-    return sent
-            try:
-                if post.get("photo"):
-                    await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
-                elif post.get("video"):
-                    await app.bot.send_video(ch, post["video"], caption=post.get("text") or "")
-                elif post.get("document"):
-                    await app.bot.send_document(ch, post["document"], caption=post.get("text") or "")
-                else:
-                    await app.bot.send_message(ch, post.get("text") or "", disable_web_page_preview=False)
-            except Exception as e:
-                log.error("send to %s failed: %s", ch, e)
-        posts_col.update_one(
-            {"_id": post["_id"]},
-            {"$set": {"posted": True, "posted_at": datetime.now(timezone.utc)}},
-        )
-        sent += 1
-    return sent
-async def autopost_once(app: Application) -> int:
-    channels = [c["chat_id"] for c in channels_col.find()]
-    if not channels:
-        log.info("autopost: no channels")
-        return 0
+    sent_count = 0
+    random.shuffle(channels)
+    used_this_round = set()
 
-    posts = list(posts_col.find({"posted": False}).sort("created_at", 1).limit(len(channels)))
-    if not posts:
-        log.info("autopost: no pending posts")
-        return 0
+    for ch in channels:
+        ch_id = ch["chat_id"]
 
-    sent = 0
-    for ch, post in zip(channels, posts):
-        try:
-            if post.get("photo"):
-                await app.bot.send_photo(ch, post["photo"], caption=post.get("text") or "")
-            elif post.get("video"):
-                await app.bot.send_video(ch, post["video"], caption=post.get("text") or "")
-            elif post.get("document"):
-                await app.bot.send_document(ch, post["document"], caption=post.get("text") or "")
-            else:
-                await app.bot.send_message(ch, text=post.get("text") or "", disable_web_page_preview=False)
-            
+        query = {"sent_to": {"$ne": ch_id}}
+        if used_this_round:
+            query["_id"] = {"$nin": list(used_this_round)}
+        candidates = list(posts_col.find(query))
+
+        if not candidates:
+            query2 = {}
+            if used_this_round:
+                query2["_id"] = {"$nin": list(used_this_round)}
+            candidates = list(posts_col.find(query2))
+            if not candidates:
+                candidates = list(posts_col.find({}))
+
+        if not candidates:
+            continue
+
+        post = random.choice(candidates)
+        ok = await _send_post(app, ch_id, post)
+        if ok:
+            used_this_round.add(post["_id"])
             posts_col.update_one(
                 {"_id": post["_id"]},
-                {"$set": {"posted": True, "posted_at": datetime.now(timezone.utc)}},
+                {"$addToSet": {"sent_to": ch_id},
+                 "$set": {"last_sent_at": datetime.now(timezone.utc)}},
             )
-            sent += 1
-        except Exception as e:
-            log.error("send to %s failed: %s", ch, e)
-            
-    return sent
+            sent_count += 1
+
+    return sent_count
+
 async def autopost_loop(app: Application):
     while True:
         try:
             n = await autopost_once(app)
             if n:
-                log.info("autopost sent %d", n)
+                log.info("autopost sent to %d channels", n)
         except Exception as e:
             log.error("autopost error: %s", e)
         await asyncio.sleep(AUTOPOST_INTERVAL)
 
-# ---------------- HEALTH SERVER ----------------
+# ---------------- HEALTH ----------------
 async def health(_req):
     try:
-        pending = posts_col.count_documents({"posted": False})
-        posted  = posts_col.count_documents({"posted": True})
-        chs     = channels_col.count_documents({})
+        total = posts_col.count_documents({})
+        chs   = channels_col.count_documents({})
     except Exception:
-        pending = posted = chs = -1
-    return web.json_response({"ok": True, "pending": pending, "posted": posted, "channels": chs})
+        total = chs = -1
+    return web.json_response({"ok": True, "posts": total, "channels": chs})
 
 async def start_health_server(app: Application):
-    # Force-clear any leftover webhook so getUpdates won't 409
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook cleared on startup")
-    except Exception as e:
-        log.warning("delete_webhook failed: %s", e)
-
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
@@ -333,7 +299,7 @@ async def start_health_server(app: Application):
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     app.bot_data["_health_runner"] = runner
-    log.info("Health server listening on :%d", PORT)
+    log.info("Health on :%d", PORT)
     app.bot_data["_autopost_task"] = asyncio.create_task(autopost_loop(app))
 
 async def stop_health_server(app: Application):
