@@ -27,6 +27,10 @@ ADMIN_IDS = [int(x) for x in re.split(r"[,\s]+", _admins_raw) if x.strip().lstri
 PORT              = int(os.getenv("PORT", "8080"))
 AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))  # 30 min
 
+POSTS_PER_CHANNEL_PER_CYCLE = int(os.getenv("POSTS_PER_CHANNEL_PER_CYCLE", "3"))
+PROMO_EVERY_N_SENDS         = int(os.getenv("PROMO_EVERY_N_SENDS", "25"))
+PROMO_LINK_THRESHOLD        = int(os.getenv("PROMO_LINK_THRESHOLD", "5"))
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
@@ -44,13 +48,19 @@ mongo = MongoClient(MONGO_URI)
 db = mongo["earnurl_bot"]
 posts_col    = db["posts"]
 channels_col = db["channels"]
+meta_col     = db["meta"]
 
 posts_col.create_index("sent_to")
+posts_col.create_index("kind")
 channels_col.create_index("chat_id", unique=True)
 
-# ---------------- EARNURL SHORTENER ----------------
+# ---------------- LINK REGEX ----------------
 URL_RE     = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
 EARNURL_RE = re.compile(r"https?://([a-z0-9-]+\.)?earnurl\.online", re.IGNORECASE)
+TELEGRAM_RE = re.compile(
+    r"https?://(?:t\.me|telegram\.me|telegram\.dog)/[^\s)>\]]+",
+    re.IGNORECASE,
+)
 
 SHORTEN_ENDPOINT = os.getenv(
     "SHORTEN_ENDPOINT",
@@ -58,6 +68,8 @@ SHORTEN_ENDPOINT = os.getenv(
 ).strip()
 
 async def shorten_url(session: aiohttp.ClientSession, long_url: str) -> str:
+    if TELEGRAM_RE.match(long_url):
+        return long_url
     if EARNURL_RE.search(long_url):
         return long_url
     if not EARNURL_API_KEY:
@@ -87,10 +99,17 @@ async def shorten_all_in_text(text: str) -> str:
         return text
     async with aiohttp.ClientSession() as session:
         for u in urls:
+            if TELEGRAM_RE.match(u):
+                continue
             short = await shorten_url(session, u)
             if short and short != u:
                 text = text.replace(u, short)
     return text
+
+def count_telegram_links(text: str) -> int:
+    if not text:
+        return 0
+    return len(TELEGRAM_RE.findall(text))
 
 # ---------------- HANDLERS ----------------
 def is_admin(uid: int) -> bool:
@@ -102,7 +121,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     await update.message.reply_text(
-        "👋 Send any text/photo/video with links — I'll shorten and queue.\n"
+        "👋 Send any photo/video with links — I'll shorten and queue.\n"
         f"Your user id: {update.effective_user.id}\n\n"
         "/addchannel <@channel or -100id>\n"
         "/removechannel <@channel or -100id>\n"
@@ -167,15 +186,28 @@ async def list_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def queue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    total = posts_col.count_documents({})
+    media = posts_col.count_documents({"kind": "media"})
+    promo = posts_col.count_documents({"kind": "promo"})
+    text  = posts_col.count_documents({"kind": "text"})
     chs   = channels_col.count_documents({})
-    await update.message.reply_text(f"📦 Posts in pool: {total}\n📡 Channels: {chs}")
+    counter = (meta_col.find_one({"_id": "counter"}) or {}).get("sends_since_promo", 0)
+    await update.message.reply_text(
+        f"📦 media: {media}\n📣 promo: {promo}\n📝 text(skipped): {text}\n"
+        f"📡 channels: {chs}\n🔁 sends since last promo: {counter}/{PROMO_EVERY_N_SENDS}"
+    )
 
 async def postnow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     n = await autopost_once(ctx.application)
-    await update.message.reply_text(f"📤 Sent to {n} channel(s).")
+    await update.message.reply_text(f"📤 Sent {n} post(s).")
+
+def classify_post(has_media: bool, text: str) -> str:
+    if has_media:
+        return "media"
+    if count_telegram_links(text) >= PROMO_LINK_THRESHOLD:
+        return "promo"
+    return "text"
 
 async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -187,11 +219,17 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     text = msg.text or msg.caption or ""
     converted = await shorten_all_in_text(text) if URL_RE.search(text) else text
 
+    has_photo = bool(msg.photo)
+    has_video = bool(msg.video)
+    has_doc   = bool(msg.document)
+    kind = classify_post(has_photo or has_video or has_doc, converted)
+
     doc = {
         "text": converted,
-        "photo": msg.photo[-1].file_id if msg.photo else None,
-        "video": msg.video.file_id if msg.video else None,
-        "document": msg.document.file_id if msg.document else None,
+        "photo": msg.photo[-1].file_id if has_photo else None,
+        "video": msg.video.file_id if has_video else None,
+        "document": msg.document.file_id if has_doc else None,
+        "kind": kind,
         "sent_to": [],
         "created_at": datetime.now(timezone.utc),
     }
@@ -225,14 +263,65 @@ async def _send_post(app: Application, ch_id, post) -> bool:
         log.error("send to %s failed: %s", ch_id, e)
         return False
 
+def _pick_post_for_channel(ch_id, used_this_round: set, kind: str):
+    query = {"kind": kind, "sent_to": {"$ne": ch_id}}
+    if used_this_round:
+        query["_id"] = {"$nin": list(used_this_round)}
+    candidates = list(posts_col.find(query))
+    if not candidates:
+        q2 = {"kind": kind}
+        if used_this_round:
+            q2["_id"] = {"$nin": list(used_this_round)}
+        candidates = list(posts_col.find(q2))
+        if not candidates:
+            candidates = list(posts_col.find({"kind": kind}))
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+async def _mark_sent(post, ch_id):
+    posts_col.update_one(
+        {"_id": post["_id"]},
+        {"$addToSet": {"sent_to": ch_id},
+         "$set": {"last_sent_at": datetime.now(timezone.utc)}},
+    )
+
+def _bump_counter(delta: int) -> int:
+    res = meta_col.find_one_and_update(
+        {"_id": "counter"},
+        {"$inc": {"sends_since_promo": delta}},
+        upsert=True,
+        return_document=True,
+    )
+    return (res or {}).get("sends_since_promo", 0)
+
+def _reset_counter():
+    meta_col.update_one({"_id": "counter"}, {"$set": {"sends_since_promo": 0}}, upsert=True)
+
+async def _broadcast_promo(app: Application, channels):
+    log.info("Broadcasting telegram-promo to %d channels", len(channels))
+    promo_used = set()
+    for ch in channels:
+        ch_id = ch["chat_id"]
+        promo = _pick_post_for_channel(ch_id, promo_used, "promo")
+        if not promo:
+            continue
+        ok = await _send_post(app, ch_id, promo)
+        if ok:
+            promo_used.add(promo["_id"])
+            await _mark_sent(promo, ch_id)
+        await asyncio.sleep(0.5)
+
 async def autopost_once(app: Application) -> int:
     channels = list(channels_col.find())
     if not channels:
         log.info("autopost: no channels")
         return 0
 
-    if posts_col.count_documents({}) == 0:
-        log.info("autopost: pool empty")
+    media_total = posts_col.count_documents({"kind": "media"})
+    promo_total = posts_col.count_documents({"kind": "promo"})
+    if media_total == 0 and promo_total == 0:
+        log.info("autopost: no media/promo posts in pool")
         return 0
 
     sent_count = 0
@@ -241,33 +330,20 @@ async def autopost_once(app: Application) -> int:
 
     for ch in channels:
         ch_id = ch["chat_id"]
-
-        query = {"sent_to": {"$ne": ch_id}}
-        if used_this_round:
-            query["_id"] = {"$nin": list(used_this_round)}
-        candidates = list(posts_col.find(query))
-
-        if not candidates:
-            query2 = {}
-            if used_this_round:
-                query2["_id"] = {"$nin": list(used_this_round)}
-            candidates = list(posts_col.find(query2))
-            if not candidates:
-                candidates = list(posts_col.find({}))
-
-        if not candidates:
-            continue
-
-        post = random.choice(candidates)
-        ok = await _send_post(app, ch_id, post)
-        if ok:
-            used_this_round.add(post["_id"])
-            posts_col.update_one(
-                {"_id": post["_id"]},
-                {"$addToSet": {"sent_to": ch_id},
-                 "$set": {"last_sent_at": datetime.now(timezone.utc)}},
-            )
-            sent_count += 1
+        for _ in range(POSTS_PER_CHANNEL_PER_CYCLE):
+            post = _pick_post_for_channel(ch_id, used_this_round, "media")
+            if not post:
+                break
+            ok = await _send_post(app, ch_id, post)
+            if ok:
+                used_this_round.add(post["_id"])
+                await _mark_sent(post, ch_id)
+                sent_count += 1
+                count = _bump_counter(1)
+                if count >= PROMO_EVERY_N_SENDS and promo_total > 0:
+                    await _broadcast_promo(app, channels)
+                    _reset_counter()
+            await asyncio.sleep(0.5)
 
     return sent_count
 
@@ -276,7 +352,7 @@ async def autopost_loop(app: Application):
         try:
             n = await autopost_once(app)
             if n:
-                log.info("autopost sent to %d channels", n)
+                log.info("autopost sent %d post(s)", n)
         except Exception as e:
             log.error("autopost error: %s", e)
         await asyncio.sleep(AUTOPOST_INTERVAL)
