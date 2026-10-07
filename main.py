@@ -11,7 +11,7 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, OperationFailure
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
-from telegram.error import Conflict
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -39,12 +39,19 @@ if not MONGO_URI:
     raise SystemExit("MONGO_URI missing!")
 
 # ---------------- DB ----------------
-mongo = MongoClient(MONGO_URI)
+mongo = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=10000,
+    socketTimeoutMS=20000,
+    retryWrites=True,
+)
 db = mongo[os.getenv("MONGO_DB", "earnurl_bot")]
 posts_col    = db["posts"]
 channels_col = db["channels"]
 meta_col     = db["meta"]
 users_col    = db["users"]
+dead_posts_col = db["dead_posts"]
 
 DEFAULT_OWNER = ADMIN_IDS[0] if ADMIN_IDS else 0
 
@@ -89,7 +96,7 @@ def migrate_legacy_docs():
 migrate_legacy_docs()
 
 try:
-    posts_col.create_index([("owner_id", 1), ("kind", 1)])
+    posts_col.create_index([("owner_id", 1), ("_id", 1)])
     posts_col.create_index("sent_to")
     users_col.create_index("user_id", unique=True)
     channels_col.create_index([("owner_id", 1), ("chat_id", 1)], unique=True)
@@ -193,20 +200,32 @@ def _extract_slugs(text: str):
 
 
 async def _slug_alive(session: aiohttp.ClientSession, slug: str) -> bool:
-    try:
-        async with session.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/link_exists",
-            json={"_slug": slug},
-            headers={"apikey": SUPABASE_ANON_KEY,
-                     "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-                     "Content-Type": "application/json"},
-            timeout=15,
-        ) as r:
-            data = await r.json(content_type=None)
-            return data is True
-    except Exception as e:
-        log.warning("link_exists check failed for %s: %s", slug, e)
-        return True  # network issue -> don't delete
+    """Return False ONLY when the website clearly says the link does not exist.
+    Any error / rate limit / timeout counts as alive so old posts are never lost by mistake."""
+    for attempt in range(2):
+        try:
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/link_exists",
+                json={"_slug": slug.strip().lower()},
+                headers={"apikey": SUPABASE_ANON_KEY,
+                         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                         "Content-Type": "application/json"},
+                timeout=15,
+            ) as r:
+                if r.status != 200:
+                    log.warning("link_exists HTTP %s for %s — keeping post", r.status, slug)
+                    if r.status == 429 and attempt == 0:
+                        await asyncio.sleep(3)
+                        continue
+                    return True
+                data = await r.json(content_type=None)
+                if data is False:
+                    return False
+                return True
+        except Exception as e:
+            log.warning("link_exists check failed for %s: %s", slug, e)
+            return True  # network issue -> don't delete
+    return True
 
 
 async def post_links_alive(post) -> bool:
@@ -220,14 +239,43 @@ async def post_links_alive(post) -> bool:
     return True
 
 
+def _archive_post(post, reason: str):
+    """Move a post to dead_posts instead of deleting forever (can be restored with /restoreposts)."""
+    try:
+        doc = dict(post)
+        doc["archived_reason"] = reason
+        doc["archived_at"] = datetime.now(timezone.utc)
+        dead_posts_col.replace_one({"_id": post["_id"]}, doc, upsert=True)
+    except Exception as e:
+        log.warning("archive failed for %s: %s", post.get("_id"), e)
+        return
+    posts_col.delete_one({"_id": post["_id"]})
+
+
 async def cleanup_dead_posts(owner_query=None) -> int:
     q = owner_query or {}
     removed = 0
     for post in list(posts_col.find(q)):
         if not await post_links_alive(post):
-            posts_col.delete_one({"_id": post["_id"]})
+            _archive_post(post, "deleted_link")
             removed += 1
+        await asyncio.sleep(0.2)  # gentle on the website, avoids rate limits
     return removed
+
+
+def restore_archived_posts(owner_query=None) -> int:
+    q = owner_query or {}
+    restored = 0
+    for doc in list(dead_posts_col.find(q)):
+        doc.pop("archived_reason", None)
+        doc.pop("archived_at", None)
+        try:
+            posts_col.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+            dead_posts_col.delete_one({"_id": doc["_id"]})
+            restored += 1
+        except Exception as e:
+            log.warning("restore failed for %s: %s", doc.get("_id"), e)
+    return restored
 
 
 # ---------------- HELPERS ----------------
@@ -405,6 +453,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/removechannel <@channel> — channel hatayein\n"
             "/listchannels — apne channels dekhein\n"
             "/queue — queue status\n"
+            "/restoreposts — purane hataye gaye posts wapas rotation me\n"
             "/postnow — abhi post bhejein\n"
             "/stats — stats\n"
             "/cleanposts — dead links wale posts hatayein\n"
@@ -528,7 +577,8 @@ async def queue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     media = posts_col.count_documents({**owner_filter(uid), "kind": "media"})
     chs   = channels_col.count_documents(owner_filter(uid))
     await update.message.reply_text(
-        f"📦 posts: {total} (media: {media})\n📡 your channels: {chs}\n"
+        f"📦 saved forever: {total} posts ({media} media)\n📡 your channels: {chs}\n"
+        f"🔁 Continuous rotation ON\n"
         f"⏱ autopost every {AUTOPOST_INTERVAL//60} min · {POSTS_PER_CYCLE}/channel/cycle")
 
 
@@ -543,6 +593,14 @@ async def cleanposts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Checking queue for deleted links…")
     n = await cleanup_dead_posts(owner_filter(uid))
     await update.message.reply_text(f"🗑 Removed {n} post(s) with deleted/expired links.")
+
+
+async def restoreposts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    n = restore_archived_posts(owner_filter(uid))
+    total = posts_col.count_documents(owner_filter(uid))
+    await update.message.reply_text(
+        f"♻️ Restored {n} old post(s) back into rotation.\n📦 Queue now: {total} posts")
 
 
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -620,33 +678,51 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 # ---------------- AUTOPOST ----------------
 async def _send_post(app: Application, ch_id, post) -> bool:
-    try:
-        if post.get("photo"):
-            await app.bot.send_photo(ch_id, post["photo"], caption=post.get("text") or "")
-        elif post.get("video"):
-            await app.bot.send_video(ch_id, post["video"], caption=post.get("text") or "")
-        elif post.get("document"):
-            await app.bot.send_document(ch_id, post["document"], caption=post.get("text") or "")
-        else:
-            await app.bot.send_message(ch_id, post.get("text") or "", disable_web_page_preview=False)
-        return True
-    except Exception as e:
-        log.error("send to %s failed: %s", ch_id, e)
-        return False
+    """Send with bounded retries so a temporary Telegram failure cannot stop rotation."""
+    for attempt in range(3):
+        try:
+            if post.get("photo"):
+                await app.bot.send_photo(ch_id, post["photo"], caption=post.get("text") or "")
+            elif post.get("video"):
+                await app.bot.send_video(ch_id, post["video"], caption=post.get("text") or "")
+            elif post.get("document"):
+                await app.bot.send_document(ch_id, post["document"], caption=post.get("text") or "")
+            else:
+                await app.bot.send_message(ch_id, post.get("text") or "", disable_web_page_preview=False)
+            return True
+        except RetryAfter as e:
+            delay = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
+            delay = min(max(delay, 1), 120)
+            log.warning("Telegram rate limit for %s; retrying in %.1fs", ch_id, delay)
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError) as e:
+            if attempt == 2:
+                log.error("send to %s failed after retries: %s", ch_id, e)
+                return False
+            delay = 2 ** attempt
+            log.warning("temporary send error for %s; retrying in %ss: %s", ch_id, delay, e)
+            await asyncio.sleep(delay)
+        except Exception as e:
+            log.error("send to %s failed: %s", ch_id, e)
+            return False
+    return False
 
 
-def _pick_post(base_q: dict, ch_id, used_this_round: set):
-    for extra in ({"kind": "media", "sent_to": {"$ne": ch_id}},
-                  {"sent_to": {"$ne": ch_id}},
-                  {"kind": "media"},
-                  {}):
-        q = {**base_q, **extra}
-        if used_this_round:
-            q["_id"] = {"$nin": list(used_this_round)}
-        cands = list(posts_col.find(q).limit(200))
-        if cands:
-            return random.choice(cands)
-    return None
+def _pick_next_post(base_q: dict, cursor, used_this_channel: set):
+    """Pick posts in a fair, persistent order and wrap after the newest post."""
+    def query(after_cursor):
+        q = dict(base_q)
+        id_filter = {}
+        if after_cursor is not None:
+            id_filter["$gt"] = after_cursor
+        if used_this_channel:
+            id_filter["$nin"] = list(used_this_channel)
+        if id_filter:
+            q["_id"] = id_filter
+        return posts_col.find_one(q, sort=[("_id", 1)])
+
+    post = query(cursor)
+    return post if post is not None else query(None)
 
 
 async def _mark_sent(post, ch_id):
@@ -656,36 +732,61 @@ async def _mark_sent(post, ch_id):
 
 
 async def autopost_for_user(app: Application, uid: int) -> int:
-    base_q = owner_filter(uid)
-    channels = list(channels_col.find(base_q))
-    if not channels:
-        log.info("autopost: no channels for %s", uid)
-        return 0
-    if posts_col.count_documents(base_q) == 0:
-        log.info("autopost: empty queue for %s", uid)
+    locks = app.bot_data.setdefault("_autopost_locks", {})
+    lock = locks.setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        log.info("autopost: cycle already running for %s", uid)
         return 0
 
-    used = set()
-    sent = 0
-    random.shuffle(channels)
-    for ch in channels:
-        ch_id = ch.get("chat_id")
-        if ch_id is None:
-            continue
-        for _ in range(POSTS_PER_CYCLE):
-            post = _pick_post(base_q, ch_id, used)
-            if not post:
-                break
-            if not await post_links_alive(post):
-                posts_col.delete_one({"_id": post["_id"]})
-                used.add(post["_id"])
+    async with lock:
+        base_q = owner_filter(uid)
+        channels = list(channels_col.find(base_q))
+        if not channels:
+            log.info("autopost: no channels for %s", uid)
+            return 0
+        if posts_col.count_documents(base_q) == 0:
+            log.info("autopost: empty queue for %s", uid)
+            return 0
+
+        sent = 0
+        random.shuffle(channels)
+        for ch in channels:
+            ch_id = ch.get("chat_id")
+            if ch_id is None:
                 continue
-            if await _send_post(app, ch_id, post):
-                used.add(post["_id"])
-                await _mark_sent(post, ch_id)
-                sent += 1
-            await asyncio.sleep(0.5)
-    return sent
+            cursor = ch.get("rotation_cursor")
+            used = set()
+            for _ in range(POSTS_PER_CYCLE):
+                post = _pick_next_post(base_q, cursor, used)
+                if not post:
+                    break
+                if not await post_links_alive(post):
+                    dead_id = post["_id"]
+                    _archive_post(post, "deleted_link")
+                    used.add(dead_id)
+                    cursor = dead_id
+                    log.info("autopost: removed post with deleted link: %s", dead_id)
+                    continue
+                if await _send_post(app, ch_id, post):
+                    used.add(post["_id"])
+                    cursor = post["_id"]
+                    await _mark_sent(post, ch_id)
+                    channels_col.update_one(
+                        {"_id": ch["_id"]},
+                        {"$set": {
+                            "rotation_cursor": cursor,
+                            "last_sent_at": datetime.now(timezone.utc),
+                        }, "$unset": {"last_error": ""}},
+                    )
+                    sent += 1
+                else:
+                    channels_col.update_one(
+                        {"_id": ch["_id"]},
+                        {"$set": {"last_error": datetime.now(timezone.utc)}},
+                    )
+                    break
+                await asyncio.sleep(0.5)
+        return sent
 
 
 async def autopost_once(app: Application) -> int:
@@ -704,27 +805,54 @@ async def autopost_loop(app: Application):
     while True:
         try:
             n = await autopost_once(app)
+            app.bot_data["_autopost_last_cycle"] = datetime.now(timezone.utc)
             log.info("autopost cycle done, sent %d post(s)", n)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.error("autopost error: %s", e)
-        await asyncio.sleep(AUTOPOST_INTERVAL)
+            log.exception("autopost cycle recovered after error: %s", e)
+        try:
+            await asyncio.sleep(max(AUTOPOST_INTERVAL, 30))
+        except asyncio.CancelledError:
+            raise
+
+
+async def autopost_supervisor(app: Application):
+    """Keep the permanent rotation alive even if its worker exits unexpectedly."""
+    while True:
+        worker = asyncio.create_task(autopost_loop(app))
+        app.bot_data["_autopost_worker"] = worker
+        try:
+            await worker
+            log.error("autopost worker stopped unexpectedly; restarting in 5 seconds")
+        except asyncio.CancelledError:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+            raise
+        except Exception as e:
+            log.exception("autopost worker crashed; restarting in 5 seconds: %s", e)
+        await asyncio.sleep(5)
 
 
 # ---------------- HEALTH ----------------
 async def health(_req):
-    try:
-        return web.json_response({
-            "ok": True,
-            "users": users_col.count_documents({}),
-            "channels": channels_col.count_documents({}),
-            "posts": posts_col.count_documents({}),
-        })
-    except Exception:
-        return web.json_response({"ok": False})
+    # Never wait for MongoDB here. Hosting providers use this endpoint to decide
+    # whether the process should stay alive, so it must answer immediately even
+    # during a temporary database slowdown.
+    telegram_app = _req.app.get("telegram_app")
+    task = telegram_app.bot_data.get("_autopost_task") if telegram_app else None
+    return web.json_response({
+        "ok": True,
+        "autopost_running": bool(task and not task.done()),
+    })
 
 
 async def start_health_server(app: Application):
     web_app = web.Application()
+    web_app["telegram_app"] = app
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
     runner = web.AppRunner(web_app)
@@ -733,7 +861,7 @@ async def start_health_server(app: Application):
     await site.start()
     app.bot_data["_health_runner"] = runner
     log.info("Health on :%d", PORT)
-    app.bot_data["_autopost_task"] = asyncio.create_task(autopost_loop(app))
+    app.bot_data["_autopost_task"] = asyncio.create_task(autopost_supervisor(app))
 
 
 async def stop_health_server(app: Application):
@@ -743,6 +871,10 @@ async def stop_health_server(app: Application):
     task = app.bot_data.get("_autopost_task")
     if task:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def error_handler(update, ctx):
@@ -774,12 +906,14 @@ def main():
     app.add_handler(CommandHandler("postnow", postnow_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("cleanposts", cleanposts_cmd))
+    app.add_handler(CommandHandler("restoreposts", restoreposts_cmd))
     app.add_handler(CommandHandler("panel", panel_cmd))
     app.add_handler(CommandHandler("purgeterabox", purgeterabox_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_message))
     app.add_error_handler(error_handler)
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # Preserve messages received during a restart; they still belong in the permanent queue.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
