@@ -631,11 +631,42 @@ def classify_post(has_media: bool, text: str) -> str:
     return "media" if has_media else "text"
 
 
+def message_text_with_links(msg) -> str:
+    """Expose Telegram's hidden hyperlinks before shortening; offsets are UTF-16."""
+    text = msg.text or msg.caption or ""
+    entities = (getattr(msg, "entities", None) if msg.text else
+                getattr(msg, "caption_entities", None)) or []
+    encoded = text.encode("utf-16-le")
+    for entity in sorted(entities, key=lambda item: item.offset, reverse=True):
+        if entity.type != "text_link" or not entity.url:
+            continue
+        start, end = entity.offset * 2, (entity.offset + entity.length) * 2
+        label = encoded[start:end].decode("utf-16-le")
+        replacement = entity.url if label == entity.url else f"{label} ({entity.url})"
+        encoded = encoded[:start] + replacement.encode("utf-16-le") + encoded[end:]
+    return encoded.decode("utf-16-le")
+
+
+def telegram_text_parts(text: str, limit: int = 4096):
+    """Split by Telegram's UTF-16 limits without breaking a Unicode character."""
+    parts, current, size = [], [], 0
+    for char in text:
+        width = 2 if ord(char) > 0xFFFF else 1
+        if size + width > limit:
+            parts.append("".join(current))
+            current, size = [], 0
+        current.append(char)
+        size += width
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
 async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
-    if await on_forwarded(update, ctx):
-        return
+    # A forwarded channel post is also queue content, not just channel setup.
+    await on_forwarded(update, ctx)
 
     uid = update.effective_user.id
     api_key = get_user_api_key(uid)
@@ -646,10 +677,13 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         return
 
     msg = update.message
-    text = msg.text or msg.caption or ""
+    text = message_text_with_links(msg)
     converted = await shorten_all_in_text(text, api_key) if URL_RE.search(text) else text
 
     has_photo = bool(msg.photo); has_video = bool(msg.video); has_doc = bool(msg.document)
+    if not text.strip() and not (has_photo or has_video or has_doc):
+        await msg.reply_text("Photo, video, document ya link wala text bhejein.")
+        return
     kind = classify_post(has_photo or has_video or has_doc, converted)
 
     posts_col.insert_one({
@@ -679,23 +713,39 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 # ---------------- AUTOPOST ----------------
 async def _send_post(app: Application, ch_id, post) -> bool:
     """Send with bounded retries so a temporary Telegram failure cannot stop rotation."""
+    errors = app.bot_data.setdefault("_send_errors", {})
+    text = post.get("text") or ""
+    has_media = bool(post.get("photo") or post.get("video") or post.get("document"))
+    # A converted caption can exceed 1024 units; keep its links in a follow-up.
+    caption = text if len(text.encode("utf-16-le")) // 2 <= 1024 else ""
+    followups = telegram_text_parts(text) if not has_media or not caption else []
+    media_sent, next_part = False, 0
     for attempt in range(3):
         try:
-            if post.get("photo"):
-                await app.bot.send_photo(ch_id, post["photo"], caption=post.get("text") or "")
-            elif post.get("video"):
-                await app.bot.send_video(ch_id, post["video"], caption=post.get("text") or "")
-            elif post.get("document"):
-                await app.bot.send_document(ch_id, post["document"], caption=post.get("text") or "")
-            else:
-                await app.bot.send_message(ch_id, post.get("text") or "", disable_web_page_preview=False)
+            if has_media and not media_sent:
+                if post.get("photo"):
+                    await app.bot.send_photo(ch_id, post["photo"], caption=caption)
+                elif post.get("video"):
+                    await app.bot.send_video(ch_id, post["video"], caption=caption)
+                else:
+                    await app.bot.send_document(ch_id, post["document"], caption=caption)
+                media_sent = True
+            while next_part < len(followups):
+                await app.bot.send_message(ch_id, followups[next_part], disable_web_page_preview=True)
+                next_part += 1
+            if not has_media and not followups:
+                errors[ch_id] = "Empty saved post; send text or supported media."
+                return False
+            errors.pop(ch_id, None)
             return True
         except RetryAfter as e:
+            errors[ch_id] = "Telegram rate limit; the post will be retried in rotation."
             delay = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
             delay = min(max(delay, 1), 120)
             log.warning("Telegram rate limit for %s; retrying in %.1fs", ch_id, delay)
             await asyncio.sleep(delay)
         except (TimedOut, NetworkError) as e:
+            errors[ch_id] = f"Temporary Telegram error: {type(e).__name__}"
             if attempt == 2:
                 log.error("send to %s failed after retries: %s", ch_id, e)
                 return False
@@ -703,6 +753,7 @@ async def _send_post(app: Application, ch_id, post) -> bool:
             log.warning("temporary send error for %s; retrying in %ss: %s", ch_id, delay, e)
             await asyncio.sleep(delay)
         except Exception as e:
+            errors[ch_id] = str(e)[:300]
             log.error("send to %s failed: %s", ch_id, e)
             return False
     return False
@@ -726,7 +777,7 @@ def _pick_next_post(base_q: dict, cursor, used_this_channel: set):
 
 
 async def _mark_sent(post, ch_id):
-    posts_col.update_one({"_id": post["_id"]},
+    await asyncio.to_thread(posts_col.update_one, {"_id": post["_id"]},
                          {"$addToSet": {"sent_to": ch_id},
                           "$set": {"last_sent_at": datetime.now(timezone.utc)}})
 
@@ -740,64 +791,83 @@ async def autopost_for_user(app: Application, uid: int) -> int:
 
     async with lock:
         base_q = owner_filter(uid)
-        channels = list(channels_col.find(base_q))
+        channels = await asyncio.to_thread(lambda: list(channels_col.find(base_q)))
         if not channels:
             log.info("autopost: no channels for %s", uid)
             return 0
-        if posts_col.count_documents(base_q) == 0:
+        if await asyncio.to_thread(posts_col.count_documents, base_q) == 0:
             log.info("autopost: empty queue for %s", uid)
             return 0
 
         sent = 0
         random.shuffle(channels)
         for ch in channels:
-            ch_id = ch.get("chat_id")
-            if ch_id is None:
-                continue
-            cursor = ch.get("rotation_cursor")
-            used = set()
-            for _ in range(POSTS_PER_CYCLE):
-                post = _pick_next_post(base_q, cursor, used)
-                if not post:
-                    break
-                if not await post_links_alive(post):
-                    dead_id = post["_id"]
-                    _archive_post(post, "deleted_link")
-                    used.add(dead_id)
-                    cursor = dead_id
-                    log.info("autopost: removed post with deleted link: %s", dead_id)
-                    continue
-                if await _send_post(app, ch_id, post):
-                    used.add(post["_id"])
-                    cursor = post["_id"]
-                    await _mark_sent(post, ch_id)
-                    channels_col.update_one(
-                        {"_id": ch["_id"]},
-                        {"$set": {
-                            "rotation_cursor": cursor,
-                            "last_sent_at": datetime.now(timezone.utc),
-                        }, "$unset": {"last_error": ""}},
-                    )
-                    sent += 1
-                else:
-                    channels_col.update_one(
-                        {"_id": ch["_id"]},
-                        {"$set": {"last_error": datetime.now(timezone.utc)}},
-                    )
-                    break
-                await asyncio.sleep(0.5)
+            try:
+                sent += await autopost_channel(app, base_q, ch)
+            except Exception as e:
+                log.exception("autopost channel %s failed; continuing: %s", ch.get("chat_id"), e)
         return sent
 
 
+async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
+    ch_id = ch.get("chat_id")
+    if ch_id is None:
+        return 0
+    cursor = ch.get("rotation_cursor")
+    used = set()
+    channel_sent = 0
+    # Deleted or invalid posts must not consume all delivery slots.
+    scan_limit = await asyncio.to_thread(posts_col.count_documents, base_q)
+    while channel_sent < POSTS_PER_CYCLE and len(used) < scan_limit:
+        post = await asyncio.to_thread(_pick_next_post, base_q, cursor, used)
+        if not post:
+            break
+        used.add(post["_id"])
+        if not await post_links_alive(post):
+            dead_id = post["_id"]
+            await asyncio.to_thread(_archive_post, post, "deleted_link")
+            used.add(dead_id)
+            cursor = dead_id
+            log.info("autopost: removed post with deleted link: %s", dead_id)
+            continue
+        if await _send_post(app, ch_id, post):
+            used.add(post["_id"])
+            cursor = post["_id"]
+            await _mark_sent(post, ch_id)
+            await asyncio.to_thread(channels_col.update_one,
+                {"_id": ch["_id"]},
+                {"$set": {
+                    "rotation_cursor": cursor,
+                    "last_sent_at": datetime.now(timezone.utc),
+                }, "$unset": {"last_error": ""}},
+            )
+            channel_sent += 1
+        else:
+            # Advance past this failure, but retain the post for the next
+            # wraparound. One invalid media file must not block all posts.
+            cursor = post["_id"]
+            await asyncio.to_thread(channels_col.update_one,
+                {"_id": ch["_id"]},
+                {"$set": {
+                    "rotation_cursor": cursor,
+                    "last_error": app.bot_data.get("_send_errors", {}).get(ch_id, "Telegram send failed"),
+                    "last_error_at": datetime.now(timezone.utc),
+                }},
+            )
+        await asyncio.sleep(0.5)
+    return channel_sent
+
 async def autopost_once(app: Application) -> int:
-    owners = [o for o in channels_col.distinct("owner_id") if o]
-    total = 0
-    for uid in owners:
-        try:
-            total += await autopost_for_user(app, uid)
-        except Exception as e:
-            log.error("autopost user %s failed: %s", uid, e)
-    return total
+    owners = [o for o in await asyncio.to_thread(channels_col.distinct, "owner_id") if o]
+    limit = asyncio.Semaphore(5)
+    async def run_owner(uid):
+        async with limit:
+            try:
+                return await autopost_for_user(app, uid)
+            except Exception as e:
+                log.exception("autopost user %s failed: %s", uid, e)
+                return 0
+    return sum(await asyncio.gather(*(run_owner(uid) for uid in owners)))
 
 
 async def autopost_loop(app: Application):
@@ -838,6 +908,24 @@ async def autopost_supervisor(app: Application):
 
 
 # ---------------- HEALTH ----------------
+async def health_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    task = ctx.application.bot_data.get("_autopost_task")
+    last_cycle = ctx.application.bot_data.get("_autopost_last_cycle")
+    channels = list(channels_col.find(owner_filter(uid)))
+    errors = [f"• {ch.get('title') or ch.get('chat_id')}: {ch['last_error']}"
+              for ch in channels if ch.get("last_error")]
+    await update.message.reply_text(
+        f"Autopost: {'running' if task and not task.done() else 'stopped'}\n"
+        f"Last cycle (UTC): {last_cycle or 'waiting for first cycle'}\n"
+        f"Channels: {len(channels)}\n"
+        f"Saved posts: {posts_col.count_documents(owner_filter(uid))}\n"
+        f"Interval: {AUTOPOST_INTERVAL // 60} min\n"
+        + ("Last send errors:\n" + "\n".join(errors[:5]) if errors else "No recorded send errors."))
+
+
 async def health(_req):
     # Never wait for MongoDB here. Hosting providers use this endpoint to decide
     # whether the process should stay alive, so it must answer immediately even
@@ -892,7 +980,7 @@ def main():
 
     app = (Application.builder().token(BOT_TOKEN)
            .post_init(start_health_server)
-           .post_shutdown(stop_health_server)
+           .post_stop(stop_health_server)
            .build())
 
     app.add_handler(CommandHandler("start", start_cmd))
@@ -903,6 +991,7 @@ def main():
     app.add_handler(CommandHandler("removechannel", remove_channel))
     app.add_handler(CommandHandler("listchannels", list_channels))
     app.add_handler(CommandHandler("queue", queue_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("postnow", postnow_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("cleanposts", cleanposts_cmd))
