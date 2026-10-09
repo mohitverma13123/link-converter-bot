@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import web
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, OperationFailure
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden, Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
@@ -26,8 +26,8 @@ _admins_raw = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or ""
 ADMIN_IDS = [int(x) for x in re.split(r"[,\s]+", _admins_raw) if x.strip().lstrip("-").isdigit()]
 
 PORT              = int(os.getenv("PORT", "8080"))
-AUTOPOST_INTERVAL = int(os.getenv("AUTOPOST_INTERVAL", "1800"))  # 30 min default
-POSTS_PER_CYCLE   = int(os.getenv("POSTS_PER_CYCLE", "3"))
+AUTOPOST_INTERVAL = 1800  # Fixed requirement: one cycle every 30 minutes.
+POSTS_PER_CYCLE   = 3
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
@@ -654,6 +654,23 @@ def telegram_text_parts(text: str, limit: int = 4096):
     return parts
 
 
+def saved_media(post):
+    """Read current albums and older single-file queue formats without losing media."""
+    media = post.get("media")
+    if isinstance(media, list) and media:
+        return [item for item in media if isinstance(item, dict)
+                and item.get("type") in ("photo", "video", "document") and item.get("file_id")]
+    for kind in ("photo", "video", "document"):
+        value = post.get(kind) or post.get(f"{kind}_file_id")
+        if isinstance(value, list):
+            value = value[-1] if value else None
+        if isinstance(value, dict):
+            value = value.get("file_id")
+        if value:
+            return [{"type": kind, "file_id": value}]
+    return []
+
+
 async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
@@ -661,7 +678,7 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     await on_forwarded(update, ctx)
 
     uid = update.effective_user.id
-    api_key = get_user_api_key(uid)
+    api_key = await asyncio.to_thread(get_user_api_key, uid)
     if not api_key:
         await update.message.reply_text(
             "⚠️ Pehle /setapi <your_key> se apna EarnURL API key set karein.\n"
@@ -670,6 +687,8 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     msg = update.message
     text = message_text_with_links(msg)
+    if not text and getattr(msg, "reply_to_message", None):
+        text = message_text_with_links(msg.reply_to_message)
     converted = await shorten_all_in_text(text, api_key) if URL_RE.search(text) else text
 
     has_photo = bool(msg.photo); has_video = bool(msg.video); has_doc = bool(msg.document)
@@ -678,26 +697,39 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         return
     kind = classify_post(has_photo or has_video or has_doc, converted)
 
-    posts_col.insert_one({
+    media = []
+    if has_photo:
+        media.append({"type": "photo", "file_id": msg.photo[-1].file_id})
+    elif has_video:
+        media.append({"type": "video", "file_id": msg.video.file_id})
+    elif has_doc:
+        media.append({"type": "document", "file_id": msg.document.file_id})
+    post = {
         "owner_id": uid,
         "text": converted,
         "photo": msg.photo[-1].file_id if has_photo else None,
         "video": msg.video.file_id if has_video else None,
         "document": msg.document.file_id if has_doc else None,
         "kind": kind,
+        "media": media,
         "sent_to": [],
         "created_at": datetime.now(timezone.utc),
-    })
+    }
+    group_id = getattr(msg, "media_group_id", None)
+    if group_id and media:
+        # Telegram delivers album items separately. Keep one permanent queue post.
+        initial = {key: value for key, value in post.items()
+                   if key not in ("media", "text", "photo", "video", "document")}
+        change = {"$setOnInsert": initial, "$push": {"media": {"$each": media}}}
+        if converted:
+            change["$set"] = {"text": converted}
+        await asyncio.to_thread(posts_col.update_one,
+                                {"owner_id": uid, "media_group_id": str(group_id)}, change, upsert=True)
+    else:
+        await asyncio.to_thread(posts_col.insert_one, post)
 
     try:
-        if has_photo:
-            await msg.reply_photo(msg.photo[-1].file_id, caption=converted or None)
-        elif has_video:
-            await msg.reply_video(msg.video.file_id, caption=converted or None)
-        elif has_doc:
-            await msg.reply_document(msg.document.file_id, caption=converted or None)
-        else:
-            await msg.reply_text(converted or "(no text)", disable_web_page_preview=False)
+        await _send_post(ctx.application, update.effective_chat.id, post)
     except Exception as e:
         log.warning("reply failed: %s", e)
 
@@ -707,23 +739,36 @@ async def _send_post(app: Application, ch_id, post) -> bool:
     """Send with bounded retries so a temporary Telegram failure cannot stop rotation."""
     errors = app.bot_data.setdefault("_send_errors", {})
     text = post.get("text") or ""
-    has_media = bool(post.get("photo") or post.get("video") or post.get("document"))
+    media = saved_media(post)
+    has_media = bool(media)
     # A converted caption can exceed 1024 units; keep its links in a follow-up.
     caption = text if len(text.encode("utf-16-le")) // 2 <= 1024 else ""
     followups = telegram_text_parts(text) if not has_media or not caption else []
-    media_sent, next_part = False, 0
+    next_media, next_part = 0, 0
     for attempt in range(3):
         try:
-            if has_media and not media_sent:
-                if post.get("photo"):
-                    await app.bot.send_photo(ch_id, post["photo"], caption=caption)
-                elif post.get("video"):
-                    await app.bot.send_video(ch_id, post["video"], caption=caption)
+            while next_media < len(media):
+                # Albums stay together; documents are grouped only with documents.
+                kind = media[next_media]["type"]
+                batch = []
+                for item in media[next_media:next_media + 10]:
+                    if (item["type"] == "document") != (kind == "document"):
+                        break
+                    batch.append(item)
+                batch_caption = caption if next_media == 0 else ""
+                if len(batch) == 1:
+                    sender = getattr(app.bot, f"send_{kind}")
+                    await sender(ch_id, batch[0]["file_id"], caption=batch_caption)
                 else:
-                    await app.bot.send_document(ch_id, post["document"], caption=caption)
-                media_sent = True
+                    factories = {"photo": InputMediaPhoto, "video": InputMediaVideo,
+                                 "document": InputMediaDocument}
+                    album = [factories[item["type"]](item["file_id"],
+                             caption=batch_caption if index == 0 else "")
+                             for index, item in enumerate(batch)]
+                    await app.bot.send_media_group(ch_id, album)
+                next_media += len(batch)
             while next_part < len(followups):
-                await app.bot.send_message(ch_id, followups[next_part], disable_web_page_preview=True)
+                await app.bot.send_message(ch_id, followups[next_part], disable_web_page_preview=has_media)
                 next_part += 1
             if not has_media and not followups:
                 errors[ch_id] = "Empty saved post; send text or supported media."
@@ -908,7 +953,15 @@ async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
     return channel_sent
 
 async def autopost_once(app: Application) -> int:
-    owners = [o for o in await asyncio.to_thread(channels_col.distinct, "owner_id") if o]
+    raw_owners = await asyncio.to_thread(channels_col.distinct, "owner_id")
+    # Manual admin posting includes legacy/unowned channels; automatic posting must too.
+    owners = set()
+    for owner in raw_owners:
+        if owner in ADMIN_IDS or owner is None or owner == 0:
+            if DEFAULT_OWNER:
+                owners.add(DEFAULT_OWNER)
+        else:
+            owners.add(owner)
     limit = asyncio.Semaphore(5)
     async def run_owner(uid):
         async with limit:
@@ -921,9 +974,14 @@ async def autopost_once(app: Application) -> int:
 
 
 async def autopost_loop(app: Application):
-    await asyncio.sleep(10)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
     while True:
+        app.bot_data["_autopost_next_cycle"] = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() + max(0, deadline - loop.time()), timezone.utc)
+        await asyncio.sleep(max(0, deadline - loop.time()))
         try:
+            app.bot_data["_autopost_cycle_started"] = datetime.now(timezone.utc)
             n = await autopost_once(app)
             app.bot_data["_autopost_last_cycle"] = datetime.now(timezone.utc)
             log.info("autopost cycle done, sent %d post(s)", n)
@@ -931,10 +989,10 @@ async def autopost_loop(app: Application):
             raise
         except Exception as e:
             log.exception("autopost cycle recovered after error: %s", e)
-        try:
-            await asyncio.sleep(max(AUTOPOST_INTERVAL, 30))
-        except asyncio.CancelledError:
-            raise
+        # Count 30 minutes from the scheduled start, not after slow sends finish.
+        deadline += AUTOPOST_INTERVAL
+        if deadline <= loop.time():
+            deadline = loop.time() + AUTOPOST_INTERVAL
 
 
 async def autopost_supervisor(app: Application):
@@ -977,6 +1035,8 @@ async def health_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Channels: {len(channels)}\n"
         f"Saved posts: {total_posts}\n"
         f"Interval: {AUTOPOST_INTERVAL // 60} min\n"
+        f"Posts per channel: {POSTS_PER_CYCLE}\n"
+        f"Next cycle (UTC): {ctx.application.bot_data.get('_autopost_next_cycle') or 'starting'}\n"
         + ("Last send errors:\n" + "\n".join(errors[:5]) if errors else "No recorded send errors."))
 
 
@@ -993,6 +1053,8 @@ async def health(_req):
 
 
 async def start_health_server(app: Application):
+    # Posting must not depend on whether a host accepts the HTTP health port.
+    app.bot_data["_autopost_task"] = asyncio.create_task(autopost_supervisor(app))
     web_app = web.Application()
     web_app["telegram_app"] = app
     web_app.router.add_get("/", health)
@@ -1000,10 +1062,14 @@ async def start_health_server(app: Application):
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    try:
+        await site.start()
+    except OSError:
+        await runner.cleanup()
+        log.exception("Health port unavailable; Telegram autopost continues")
+        return
     app.bot_data["_health_runner"] = runner
     log.info("Health on :%d", PORT)
-    app.bot_data["_autopost_task"] = asyncio.create_task(autopost_supervisor(app))
 
 
 async def stop_health_server(app: Application):
