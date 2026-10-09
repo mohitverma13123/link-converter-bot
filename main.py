@@ -11,7 +11,7 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, OperationFailure
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
-from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -358,19 +358,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if data == "postnow":
-        chs = channels_col.count_documents(owner_filter(uid))
-        posts = posts_col.count_documents(owner_filter(uid))
-        if chs == 0:
-            await q.message.reply_text("❌ Koi channel add nahi hai. /addchannel @yourchannel",
-                                       reply_markup=_panel_markup())
-            return
-        if posts == 0:
-            await q.message.reply_text("❌ Queue khali hai. Photo/video + link bhejein.",
-                                       reply_markup=_panel_markup())
-            return
-        await q.message.reply_text(f"📤 Posting to {chs} channel(s)…")
-        n = await autopost_for_user(ctx.application, uid)
-        await q.message.reply_text(f"✅ Sent {n} post(s).", reply_markup=_panel_markup())
+        await q.message.reply_text("📤 Posting check kar raha hoon…")
+        await q.message.reply_text(await manual_post_result(ctx.application, uid),
+                                   reply_markup=_panel_markup())
 
     elif data == "queue":
         total = posts_col.count_documents(owner_filter(uid))
@@ -583,9 +573,11 @@ async def queue_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def postnow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
     uid = update.effective_user.id
-    n = await autopost_for_user(ctx.application, uid)
-    await update.message.reply_text(f"📤 Sent {n} post(s).")
+    await update.message.reply_text("📤 Posting check kar raha hoon…")
+    await update.message.reply_text(await manual_post_result(ctx.application, uid))
 
 
 async def cleanposts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -744,8 +736,13 @@ async def _send_post(app: Application, ch_id, post) -> bool:
             delay = min(max(delay, 1), 120)
             log.warning("Telegram rate limit for %s; retrying in %.1fs", ch_id, delay)
             await asyncio.sleep(delay)
+        except (BadRequest, Forbidden) as e:
+            # BadRequest inherits NetworkError: do not hide permanent errors as outages.
+            errors[ch_id] = str(e)[:300]
+            log.error("Telegram rejected send to %s: %s", ch_id, e)
+            return False
         except (TimedOut, NetworkError) as e:
-            errors[ch_id] = f"Temporary Telegram error: {type(e).__name__}"
+            errors[ch_id] = f"{type(e).__name__}: {str(e)[:250]}"
             if attempt == 2:
                 log.error("send to %s failed after retries: %s", ch_id, e)
                 return False
@@ -790,12 +787,17 @@ async def autopost_for_user(app: Application, uid: int) -> int:
         return 0
 
     async with lock:
+        result = {"channels": 0, "posts": 0, "sent": 0, "deleted": 0, "errors": []}
+        app.bot_data.setdefault("_autopost_results", {})[uid] = result
         base_q = owner_filter(uid)
+        result["_query"] = base_q
         channels = await asyncio.to_thread(lambda: list(channels_col.find(base_q)))
+        result["channels"] = len(channels)
         if not channels:
             log.info("autopost: no channels for %s", uid)
             return 0
-        if await asyncio.to_thread(posts_col.count_documents, base_q) == 0:
+        result["posts"] = await asyncio.to_thread(posts_col.count_documents, base_q)
+        if result["posts"] == 0:
             log.info("autopost: empty queue for %s", uid)
             return 0
 
@@ -803,16 +805,52 @@ async def autopost_for_user(app: Application, uid: int) -> int:
         random.shuffle(channels)
         for ch in channels:
             try:
-                sent += await autopost_channel(app, base_q, ch)
+                delivered = await autopost_channel(app, base_q, ch)
+                sent += delivered
+                result["sent"] = sent
             except Exception as e:
                 log.exception("autopost channel %s failed; continuing: %s", ch.get("chat_id"), e)
+                result["errors"].append(f"{ch.get('title') or ch.get('chat_id')}: {str(e)[:300]}")
+            error = app.bot_data.get("_send_errors", {}).get(ch.get("chat_id"))
+            if error:
+                result["errors"].append(f"{ch.get('title') or ch.get('chat_id')}: {error}")
         return sent
+
+
+async def manual_post_result(app: Application, uid: int) -> str:
+    """Return the actual reason instead of reporting every early exit as Sent 0."""
+    lock = app.bot_data.get("_autopost_locks", {}).get(uid)
+    if lock and lock.locked():
+        return "⏳ Posting pehle se chal rahi hai. Thoda wait karein, phir /health bhejein."
+    try:
+        sent = await autopost_for_user(app, uid)
+    except Exception as e:
+        log.exception("manual posting failed for %s", uid)
+        return f"❌ Posting check fail hua: {str(e)[:300]}"
+    result = app.bot_data.get("_autopost_results", {}).get(uid, {})
+    lines = [f"📤 Sent {sent} post(s).",
+             f"📡 Channels: {result.get('channels', 0)} · Saved posts: {result.get('posts', 0)}"]
+    if not result.get("channels"):
+        lines.append("❌ Channel nahi mila. /addchannel @yourchannel bhejein; bot ko post permission dein.")
+    elif not result.get("posts"):
+        lines.append("❌ Queue khali hai. Bot ko post bhejein. Purane archived posts ke liye /restoreposts.")
+    elif POSTS_PER_CYCLE <= 0:
+        lines.append("❌ POSTS_PER_CYCLE setting 1 ya usse zyada honi chahiye.")
+    if result.get("deleted"):
+        lines.append(f"🗑 Deleted website links wale {result['deleted']} posts skip hue.")
+    if result.get("errors"):
+        lines.append("❌ Posting errors:\n" + "\n".join(result["errors"][:5]))
+    elif sent == 0 and result.get("posts") and result.get("channels") and not result.get("deleted"):
+        lines.append("❌ Koi deliverable post nahi mila. /health ka result bhejein.")
+    return "\n".join(lines)
 
 
 async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
     ch_id = ch.get("chat_id")
     if ch_id is None:
+        app.bot_data.setdefault("_send_errors", {})[None] = "Saved channel ID missing; /addchannel se channel dobara jodein."
         return 0
+    app.bot_data.setdefault("_send_errors", {}).pop(ch_id, None)
     cursor = ch.get("rotation_cursor")
     used = set()
     channel_sent = 0
@@ -826,6 +864,10 @@ async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
         if not await post_links_alive(post):
             dead_id = post["_id"]
             await asyncio.to_thread(_archive_post, post, "deleted_link")
+            for result in app.bot_data.get("_autopost_results", {}).values():
+                # Only the active owner's report belongs to this channel cycle.
+                if result.get("_query") == base_q:
+                    result["deleted"] += 1
             used.add(dead_id)
             cursor = dead_id
             log.info("autopost: removed post with deleted link: %s", dead_id)
@@ -833,27 +875,35 @@ async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
         if await _send_post(app, ch_id, post):
             used.add(post["_id"])
             cursor = post["_id"]
-            await _mark_sent(post, ch_id)
-            await asyncio.to_thread(channels_col.update_one,
-                {"_id": ch["_id"]},
-                {"$set": {
-                    "rotation_cursor": cursor,
-                    "last_sent_at": datetime.now(timezone.utc),
-                }, "$unset": {"last_error": ""}},
-            )
+            # Telegram delivery already succeeded; a bookkeeping failure is not Sent 0.
             channel_sent += 1
+            try:
+                await _mark_sent(post, ch_id)
+                await asyncio.to_thread(channels_col.update_one,
+                    {"_id": ch["_id"]},
+                    {"$set": {
+                        "rotation_cursor": cursor,
+                        "last_sent_at": datetime.now(timezone.utc),
+                    }, "$unset": {"last_error": ""}},
+                )
+            except Exception as e:
+                app.bot_data.setdefault("_send_errors", {})[ch_id] = f"Post sent, saved status update failed: {str(e)[:200]}"
+                log.exception("sent post bookkeeping failed for %s", ch_id)
         else:
             # Advance past this failure, but retain the post for the next
             # wraparound. One invalid media file must not block all posts.
             cursor = post["_id"]
-            await asyncio.to_thread(channels_col.update_one,
-                {"_id": ch["_id"]},
-                {"$set": {
-                    "rotation_cursor": cursor,
-                    "last_error": app.bot_data.get("_send_errors", {}).get(ch_id, "Telegram send failed"),
-                    "last_error_at": datetime.now(timezone.utc),
-                }},
-            )
+            try:
+                await asyncio.to_thread(channels_col.update_one,
+                    {"_id": ch["_id"]},
+                    {"$set": {
+                        "rotation_cursor": cursor,
+                        "last_error": app.bot_data.get("_send_errors", {}).get(ch_id, "Telegram send failed"),
+                        "last_error_at": datetime.now(timezone.utc),
+                    }},
+                )
+            except Exception:
+                log.exception("failed post cursor update failed for %s; continuing", ch_id)
         await asyncio.sleep(0.5)
     return channel_sent
 
@@ -914,14 +964,18 @@ async def health_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     task = ctx.application.bot_data.get("_autopost_task")
     last_cycle = ctx.application.bot_data.get("_autopost_last_cycle")
-    channels = list(channels_col.find(owner_filter(uid)))
-    errors = [f"• {ch.get('title') or ch.get('chat_id')}: {ch['last_error']}"
-              for ch in channels if ch.get("last_error")]
+    channels = await asyncio.to_thread(lambda: list(channels_col.find(owner_filter(uid))))
+    total_posts = await asyncio.to_thread(posts_col.count_documents, owner_filter(uid))
+    errors = []
+    for ch in channels:
+        error = ctx.application.bot_data.get("_send_errors", {}).get(ch.get("chat_id")) or ch.get("last_error")
+        if error:
+            errors.append(f"• {ch.get('title') or ch.get('chat_id')}: {error}")
     await update.message.reply_text(
         f"Autopost: {'running' if task and not task.done() else 'stopped'}\n"
         f"Last cycle (UTC): {last_cycle or 'waiting for first cycle'}\n"
         f"Channels: {len(channels)}\n"
-        f"Saved posts: {posts_col.count_documents(owner_filter(uid))}\n"
+        f"Saved posts: {total_posts}\n"
         f"Interval: {AUTOPOST_INTERVAL // 60} min\n"
         + ("Last send errors:\n" + "\n".join(errors[:5]) if errors else "No recorded send errors."))
 
