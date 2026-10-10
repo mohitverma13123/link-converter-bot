@@ -3,7 +3,8 @@ import re
 import random
 import asyncio
 import logging
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 from aiohttp import web
@@ -52,6 +53,8 @@ channels_col = db["channels"]
 meta_col     = db["meta"]
 users_col    = db["users"]
 dead_posts_col = db["dead_posts"]
+daily_posts_col = db["daily_post_deliveries"]
+POSTING_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 DEFAULT_OWNER = ADMIN_IDS[0] if ADMIN_IDS else 0
 
@@ -98,6 +101,7 @@ migrate_legacy_docs()
 try:
     posts_col.create_index([("owner_id", 1), ("_id", 1)])
     posts_col.create_index("sent_to")
+    daily_posts_col.create_index([("owner_scope", 1), ("day", 1)])
     users_col.create_index("user_id", unique=True)
     channels_col.create_index([("owner_id", 1), ("chat_id", 1)], unique=True)
 except Exception as e:
@@ -315,6 +319,7 @@ def save_channel(uid: int, ch_id, title=None) -> bool:
 def _panel_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Post Now (all my channels)", callback_data="postnow")],
+        [InlineKeyboardButton("🗑 Delete my saved queue", callback_data="clearqueue_ask")],
         [InlineKeyboardButton("🗑 Delete ALL Terabox links", callback_data="purge_tb_ask")],
         [InlineKeyboardButton("🧹 Clean dead posts", callback_data="cleanposts"),
          InlineKeyboardButton("📦 Queue", callback_data="queue")],
@@ -356,11 +361,29 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = q.data or ""
     await q.answer()
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        return
 
     if data == "postnow":
         await q.message.reply_text("📤 Posting check kar raha hoon…")
         await q.message.reply_text(await manual_post_result(ctx.application, uid),
                                    reply_markup=_panel_markup())
+
+    elif data == "clearqueue_ask":
+        ctx.user_data["clearqueue_confirm_until"] = datetime.now(timezone.utc).timestamp() + 60
+        await q.message.reply_text(
+            "⚠️ Aapke bot mein saved saare posts, photos aur archived posts permanently delete honge. "
+            "Channels, API key aur website ke short links delete NAHI honge. Confirm?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Delete my queue", callback_data="clearqueue_yes"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]))
+
+    elif data == "clearqueue_yes":
+        expires = ctx.user_data.pop("clearqueue_confirm_until", 0)
+        if expires < datetime.now(timezone.utc).timestamp():
+            await q.message.reply_text("Confirmation expire ho gayi. /panel se dobara delete choose karein.")
+            return
+        await q.message.reply_text(await clear_saved_queue(ctx.application, uid), reply_markup=_panel_markup())
 
     elif data == "queue":
         total = posts_col.count_documents(owner_filter(uid))
@@ -403,6 +426,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(f"❌ Failed: {res.get('error')}", reply_markup=_panel_markup())
 
     elif data == "cancel":
+        ctx.user_data.pop("clearqueue_confirm_until", None)
         await q.message.reply_text("Cancelled.", reply_markup=_panel_markup())
 
 
@@ -735,9 +759,85 @@ async def handle_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 # ---------------- AUTOPOST ----------------
+def post_content_key(post):
+    """Duplicate queue records with the same links are one daily post."""
+    urls = sorted(set(url.rstrip(".,;") for url in URL_RE.findall(post.get("text") or "")))
+    content = repr(urls) if urls else repr((post.get("text") or "", saved_media(post)))
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+async def create_daily_distribution(base_q):
+    day = datetime.now(POSTING_TIMEZONE).date().isoformat()
+    owner_scope = hashlib.sha256(repr(base_q).encode()).hexdigest()
+    records = await asyncio.to_thread(lambda: list(daily_posts_col.find(
+        {"owner_scope": owner_scope, "day": day})))
+    return {"day": day, "owner_scope": owner_scope, "used": {r["post_id"] for r in records},
+            "contents": {r["content_key"] for r in records}, "lock": asyncio.Lock()}
+
+
+async def claim_daily_post(base_q, cursor, used, distribution, ch_id):
+    """Reserve before sending: parallel channels and restarts cannot select the same content."""
+    async with distribution["lock"]:
+        post = await asyncio.to_thread(_pick_next_post, base_q, cursor, used | distribution["used"])
+        if not post:
+            return None, None
+        used.add(post["_id"])
+        key = post_content_key(post)
+        if key in distribution["contents"]:
+            return post, None
+        claim_id = f"{distribution['owner_scope']}:{distribution['day']}:{key}"
+        try:
+            await asyncio.to_thread(daily_posts_col.insert_one, {
+                "_id": claim_id, "owner_scope": distribution["owner_scope"], "day": distribution["day"],
+                "content_key": key, "post_id": post["_id"], "chat_id": ch_id,
+                "state": "reserved", "created_at": datetime.now(timezone.utc)})
+        except DuplicateKeyError:
+            distribution["contents"].add(key)
+            distribution["used"].add(post["_id"])
+            return post, None
+        distribution["contents"].add(key)
+        distribution["used"].add(post["_id"])
+        return post, claim_id
+
+
+async def finish_daily_claim(distribution, post, claim_id, delivered):
+    if delivered:
+        await asyncio.to_thread(daily_posts_col.update_one, {"_id": claim_id},
+                                {"$set": {"state": "sent", "sent_at": datetime.now(timezone.utc)}})
+    else:
+        # Only confirmed failures release a claim; cancellation leaves an uncertain
+        # delivery reserved until tomorrow rather than risking a duplicate.
+        async with distribution["lock"]:
+            await asyncio.to_thread(daily_posts_col.delete_one, {"_id": claim_id})
+            distribution["contents"].discard(post_content_key(post))
+            # Keep the ID excluded for this cycle so another channel does not retry bad media.
+
+
+async def clear_saved_queue(app: Application, uid: int) -> str:
+    """Explicitly clear only this owner's bot queue, never website links or channels."""
+    lock = app.bot_data.setdefault("_autopost_locks", {}).setdefault(uid, asyncio.Lock())
+    if lock.locked():
+        return "⏳ Posting chal rahi hai. Cycle khatam hone par /panel se delete dobara confirm karein."
+    async with lock:
+        query = owner_filter(uid)
+        try:
+            active = await asyncio.to_thread(posts_col.delete_many, query)
+            archived = await asyncio.to_thread(dead_posts_col.delete_many, query)
+            await asyncio.to_thread(channels_col.update_many, query,
+                                    {"$unset": {"rotation_cursor": "", "last_error": "", "last_error_at": ""}})
+            app.bot_data.get("_autopost_results", {}).pop(uid, None)
+            return (f"✅ Queue cleared: {active.deleted_count} saved + {archived.deleted_count} archived posts.\n"
+                    "Ab naye photo/link posts bhejein. Channels aur website links safe hain.")
+        except Exception as e:
+            log.exception("queue clear failed for %s", uid)
+            return f"❌ Queue clear poora nahi hua: {str(e)[:200]}. /queue check karein."
+
+
 async def _send_post(app: Application, ch_id, post) -> bool:
     """Send with bounded retries so a temporary Telegram failure cannot stop rotation."""
     errors = app.bot_data.setdefault("_send_errors", {})
+    blocked = app.bot_data.setdefault("_channel_send_blocked", set())
+    blocked.discard(ch_id)
     text = post.get("text") or ""
     media = saved_media(post)
     has_media = bool(media)
@@ -784,6 +884,11 @@ async def _send_post(app: Application, ch_id, post) -> bool:
         except (BadRequest, Forbidden) as e:
             # BadRequest inherits NetworkError: do not hide permanent errors as outages.
             errors[ch_id] = str(e)[:300]
+            reason = str(e).lower()
+            if isinstance(e, Forbidden) or any(word in reason for word in (
+                    "administrator rights", "not enough rights", "chat not found",
+                    "channel_private", "chat_write_forbidden", "bot is not a member")):
+                blocked.add(ch_id)
             log.error("Telegram rejected send to %s: %s", ch_id, e)
             return False
         except (TimedOut, NetworkError) as e:
@@ -832,7 +937,8 @@ async def autopost_for_user(app: Application, uid: int) -> int:
         return 0
 
     async with lock:
-        result = {"channels": 0, "posts": 0, "sent": 0, "deleted": 0, "errors": []}
+        result = {"channels": 0, "posts": 0, "sent": 0, "deleted": 0, "errors": [],
+                  "started_at": datetime.now(timezone.utc), "channel_progress": {}}
         app.bot_data.setdefault("_autopost_results", {})[uid] = result
         base_q = owner_filter(uid)
         result["_query"] = base_q
@@ -846,19 +952,28 @@ async def autopost_for_user(app: Application, uid: int) -> int:
             log.info("autopost: empty queue for %s", uid)
             return 0
 
-        sent = 0
+        result["_daily_distribution"] = await create_daily_distribution(base_q)
         random.shuffle(channels)
-        for ch in channels:
-            try:
-                delivered = await autopost_channel(app, base_q, ch)
-                sent += delivered
-                result["sent"] = sent
-            except Exception as e:
-                log.exception("autopost channel %s failed; continuing: %s", ch.get("chat_id"), e)
-                result["errors"].append(f"{ch.get('title') or ch.get('chat_id')}: {str(e)[:300]}")
-            error = app.bot_data.get("_send_errors", {}).get(ch.get("chat_id"))
-            if error:
-                result["errors"].append(f"{ch.get('title') or ch.get('chat_id')}: {error}")
+        limit = asyncio.Semaphore(3)
+        async def run_channel(ch):
+            async with limit:
+                try:
+                    delivered = await asyncio.wait_for(autopost_channel(app, base_q, ch), timeout=180)
+                except asyncio.TimeoutError:
+                    delivered = result["channel_progress"].get(ch.get("chat_id"), 0)
+                    app.bot_data.setdefault("_send_errors", {})[ch.get("chat_id")] = (
+                        "Channel check took too long; next cycle will retry. Other channels continue.")
+                except Exception as e:
+                    delivered = result["channel_progress"].get(ch.get("chat_id"), 0)
+                    log.exception("autopost channel %s failed; continuing", ch.get("chat_id"))
+                    result["errors"].append(f"{ch.get('title') or ch.get('chat_id')}: {str(e)[:300]}")
+                error = app.bot_data.get("_send_errors", {}).get(ch.get("chat_id"))
+                if error:
+                    result["errors"].append(f"{ch.get('title') or ch.get('chat_id')}: {error}")
+                return delivered
+        sent = sum(await asyncio.gather(*(run_channel(ch) for ch in channels)))
+        result["sent"] = sent
+        result["finished_at"] = datetime.now(timezone.utc)
         return sent
 
 
@@ -866,7 +981,10 @@ async def manual_post_result(app: Application, uid: int) -> str:
     """Return the actual reason instead of reporting every early exit as Sent 0."""
     lock = app.bot_data.get("_autopost_locks", {}).get(uid)
     if lock and lock.locked():
-        return "⏳ Posting pehle se chal rahi hai. Thoda wait karein, phir /health bhejein."
+        result = app.bot_data.get("_autopost_results", {}).get(uid, {})
+        errors = result.get("errors", [])
+        return (f"⏳ Posting pehle se chal rahi hai. Ab tak {result.get('sent', 0)} posts sent.\n"
+                + ("\n".join(errors[:3]) if errors else "Baaki channels check ho rahe hain; /health se progress dekhein."))
     try:
         sent = await autopost_for_user(app, uid)
     except Exception as e:
@@ -886,7 +1004,8 @@ async def manual_post_result(app: Application, uid: int) -> str:
     if result.get("errors"):
         lines.append("❌ Posting errors:\n" + "\n".join(result["errors"][:5]))
     elif sent == 0 and result.get("posts") and result.get("channels") and not result.get("deleted"):
-        lines.append("❌ Koi deliverable post nahi mila. /health ka result bhejein.")
+        lines.append("Aaj ke unused posts nahi mile ya queue check adhura hai. Naye image/link posts bhejein; "
+                     "purane posts agle din phir rotate honge. /health se errors dekhein.")
     return "\n".join(lines)
 
 
@@ -899,14 +1018,28 @@ async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
     cursor = ch.get("rotation_cursor")
     used = set()
     channel_sent = 0
+    distribution = next((r.get("_daily_distribution") for r in
+                         app.bot_data.get("_autopost_results", {}).values()
+                         if r.get("_query") == base_q), None)
     # Deleted or invalid posts must not consume all delivery slots.
-    scan_limit = await asyncio.to_thread(posts_col.count_documents, base_q)
+    scan_limit = min(30, await asyncio.to_thread(posts_col.count_documents, base_q))
     while channel_sent < POSTS_PER_CYCLE and len(used) < scan_limit:
-        post = await asyncio.to_thread(_pick_next_post, base_q, cursor, used)
+        claim_id = None
+        if distribution:
+            post, claim_id = await claim_daily_post(base_q, cursor, used, distribution, ch_id)
+        else:
+            post = await asyncio.to_thread(_pick_next_post, base_q, cursor, used)
         if not post:
             break
         used.add(post["_id"])
+        if distribution and not claim_id:
+            cursor = post["_id"]
+            await asyncio.to_thread(channels_col.update_one, {"_id": ch["_id"]},
+                                    {"$set": {"rotation_cursor": cursor}})
+            continue
         if not await post_links_alive(post):
+            if distribution:
+                await finish_daily_claim(distribution, post, claim_id, False)
             dead_id = post["_id"]
             await asyncio.to_thread(_archive_post, post, "deleted_link")
             for result in app.bot_data.get("_autopost_results", {}).values():
@@ -922,7 +1055,13 @@ async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
             cursor = post["_id"]
             # Telegram delivery already succeeded; a bookkeeping failure is not Sent 0.
             channel_sent += 1
+            for result in app.bot_data.get("_autopost_results", {}).values():
+                if result.get("_query") == base_q:
+                    result["sent"] += 1
+                    result["channel_progress"][ch_id] = channel_sent
             try:
+                if distribution:
+                    await finish_daily_claim(distribution, post, claim_id, True)
                 await _mark_sent(post, ch_id)
                 await asyncio.to_thread(channels_col.update_one,
                     {"_id": ch["_id"]},
@@ -935,6 +1074,12 @@ async def autopost_channel(app: Application, base_q: dict, ch: dict) -> int:
                 app.bot_data.setdefault("_send_errors", {})[ch_id] = f"Post sent, saved status update failed: {str(e)[:200]}"
                 log.exception("sent post bookkeeping failed for %s", ch_id)
         else:
+            if distribution:
+                await finish_daily_claim(distribution, post, claim_id, False)
+            # A channel permission error affects EVERY post: do not scan 1,588
+            # records or advance its cursor. Retry the same post after rights are fixed.
+            if ch_id in app.bot_data.get("_channel_send_blocked", set()):
+                break
             # Advance past this failure, but retain the post for the next
             # wraparound. One invalid media file must not block all posts.
             cursor = post["_id"]
@@ -1022,6 +1167,8 @@ async def health_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     task = ctx.application.bot_data.get("_autopost_task")
     last_cycle = ctx.application.bot_data.get("_autopost_last_cycle")
+    result = ctx.application.bot_data.get("_autopost_results", {}).get(uid, {})
+    lock = ctx.application.bot_data.get("_autopost_locks", {}).get(uid)
     channels = await asyncio.to_thread(lambda: list(channels_col.find(owner_filter(uid))))
     total_posts = await asyncio.to_thread(posts_col.count_documents, owner_filter(uid))
     errors = []
@@ -1031,7 +1178,9 @@ async def health_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             errors.append(f"• {ch.get('title') or ch.get('chat_id')}: {error}")
     await update.message.reply_text(
         f"Autopost: {'running' if task and not task.done() else 'stopped'}\n"
-        f"Last cycle (UTC): {last_cycle or 'waiting for first cycle'}\n"
+        f"Last completed cycle (UTC): {last_cycle or 'not completed yet'}\n"
+        f"Current posting: {'in progress' if lock and lock.locked() else 'idle'} · Sent: {result.get('sent', 0)}\n"
+        f"Cycle started (UTC): {result.get('started_at') or 'waiting'}\n"
         f"Channels: {len(channels)}\n"
         f"Saved posts: {total_posts}\n"
         f"Interval: {AUTOPOST_INTERVAL // 60} min\n"
